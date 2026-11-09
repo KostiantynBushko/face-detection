@@ -12,9 +12,9 @@ Frame (BGR) ──► FaceDetector ──► FaceBox[] ──► FaceRecognizer 
 ```
 
 > **Naming.** The project is currently called `face-detection`. It is a
-> standalone git repository that is intended to become a **submodule** of
-> `objective-control`. Renaming it later is straightforward — see
-> [Renaming](#renaming).
+> standalone git repository consumed by `objective-control` as a **git
+> submodule** at `third_party/face-detection`. Renaming it later is
+> straightforward — see [Renaming](#renaming).
 
 ---
 
@@ -217,11 +217,16 @@ CMakePresets.json                             debug / release / asan presets
 
 ## Integration with `objective-control`
 
-This project is currently an in-tree standalone repository at
-`objective-control/third_party/face-detection`. It is intended to become a
-git submodule.
+This repository is consumed by `objective-control` as a git submodule:
 
-To consume it as a subdirectory today:
+```
+objective-control/
+|-- .gitmodules
+|-- third_party/
+|   `-- face-detection/      <- this repository (gitlink)
+```
+
+The parent wires it up with:
 
 ```cmake
 add_subdirectory(third_party/face-detection)
@@ -231,6 +236,28 @@ target_link_libraries(objective-control PUBLIC face-detection::face_detection)
 When `objective-control` is the top-level project, `FACE_DETECTION_BUILD_APPS`
 and `FACE_DETECTION_BUILD_TESTS` default to `OFF`, so the submodule does not
 build its own app or tests inside the parent build.
+
+### Cloning
+
+```sh
+git clone --recurse-submodules <objective-control-url>
+```
+
+or, for an existing clone:
+
+```sh
+git submodule update --init --recursive
+```
+
+The submodule's `origin` currently points at a local stand-in repository
+(`/home/kbush/milproj/face-detection.git`). Point it at a real hosted remote
+when one exists:
+
+```sh
+cd third_party/face-detection
+git remote set-url origin <real-url>
+git push -u origin master
+```
 
 ## Renaming
 
