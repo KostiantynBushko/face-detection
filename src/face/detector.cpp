@@ -68,10 +68,18 @@ FaceDetector& FaceDetector::operator=(FaceDetector&&) noexcept = default;
 bool FaceDetector::open(const Options& options) {
 #ifdef FD_HAVE_FACE_STACK
     impl_->options = options;
-    impl_->detector = cv::FaceDetectorYN::create(
-        options.model_path, "",
-        cv::Size(320, 320), // overwritten by setInputSize() before every run
-        options.score_threshold, options.nms_threshold, options.top_k);
+    try {
+        impl_->detector = cv::FaceDetectorYN::create(
+            options.model_path, "",
+            cv::Size(320, 320), // overwritten by setInputSize() before every run
+            options.score_threshold, options.nms_threshold, options.top_k);
+    } catch (const cv::Exception&) {
+        // A missing or malformed model file makes OpenCV throw. open() is
+        // documented to report failure by returning false, so the exception
+        // must not escape to the caller.
+        impl_->detector = nullptr;
+        return false;
+    }
     return impl_->detector != nullptr;
 #else
     (void)options;

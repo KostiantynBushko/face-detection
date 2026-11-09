@@ -106,6 +106,11 @@ const fd::FaceDatabase::Match match = database.match(embedding);
 if (match.matched) {
     // match.person_id == 42
 }
+
+// Persist the enrolments. The database stores embeddings only, never
+// photographs, and the file format is shared with objective-control.
+database.save("faces.db");
+database.load("faces.db");
 ```
 
 ### Key types
@@ -115,7 +120,7 @@ if (match.matched) {
 | `fd::Image`       | Dense row-major BGR (3ch) or grayscale (1ch). Layout-compatible with `oc::Frame`. |
 | `fd::FaceBox`     | Bounding box, confidence in [0,1], and five landmarks.                   |
 | `fd::Embedding`   | 128-dimensional, L2-normalised feature vector.                          |
-| `fd::FaceDatabase`| Enrolled embeddings keyed by an application-defined person id.           |
+| `fd::FaceDatabase`| Enrolled embeddings keyed by an application-defined person id. `save`/`load` persist them. |
 
 ### Distance semantics
 
@@ -199,6 +204,39 @@ stack in two independent steps.
 | `-h`, `--help`    | —                    | Print the option list                       |
 
 Exit codes: `0` success, `1` runtime error, `2` bad usage.
+
+### Locating the model files
+
+The model directory is resolved **relative to the current working directory**,
+not relative to the executable. The lookup order is:
+
+1. `--models=<dir>`
+2. the `FACE_DETECTION_MODELS` environment variable
+3. `./models`, relative to the working directory
+
+Launching the app from `build/debug/bin/` therefore fails with:
+
+```text
+Could not load the detector model: OpenCV(4.10.0) ./modules/dnn/src/onnx/onnx_importer.cpp:277:
+error: (-5:Bad argument) Can't read ONNX file: models/face_detection_yunet_2023mar.onnx
+in function 'ONNXImporter'
+```
+
+Give the app the model directory explicitly:
+
+```sh
+./build/debug/bin/face-detection-app --image=photo.jpg \
+    --models=/path/to/face-detection/models
+```
+
+Or export it once for the current shell session:
+
+```sh
+export FACE_DETECTION_MODELS=/path/to/face-detection/models
+```
+
+Running the app from the repository root also works, because `models/` sits
+next to the sources.
 
 ## Layout
 

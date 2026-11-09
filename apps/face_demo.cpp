@@ -10,9 +10,7 @@
 #include "face-detection/face/recognizer.hpp"
 #include "face-detection/image.hpp"
 
-#include <cstdint>
 #include <cstdlib>
-#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -64,62 +62,6 @@ bool flag(int argc, char** argv, const std::string& name) {
 }
 
 // ---------------------------------------------------------------------------
-// Face database persistence.
-//
-// The on-disk format is deliberately trivial:
-//   magic "FDB1" | uint32 count | { int32 person_id, float[128] } * count
-// ---------------------------------------------------------------------------
-constexpr char kDbMagic[4] = {'F', 'D', 'B', '1'};
-
-bool loadDatabase(const std::string& path, fd::FaceDatabase& db) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        return false;
-    }
-    char magic[4] = {};
-    in.read(magic, sizeof(magic));
-    if (!in || std::string(magic, sizeof(magic)) != std::string(kDbMagic, 4)) {
-        return false;
-    }
-    std::uint32_t count = 0;
-    in.read(reinterpret_cast<char*>(&count), sizeof(count));
-    if (!in) {
-        return false;
-    }
-    for (std::uint32_t i = 0; i < count; ++i) {
-        std::int32_t person_id = 0;
-        in.read(reinterpret_cast<char*>(&person_id), sizeof(person_id));
-        fd::Embedding embedding;
-        in.read(reinterpret_cast<char*>(embedding.values.data()),
-                static_cast<std::streamsize>(sizeof(float) *
-                                             fd::Embedding::kDimension));
-        if (!in) {
-            return false;
-        }
-        embedding.valid = true;
-        db.enroll(person_id, embedding);
-    }
-    return true;
-}
-
-bool saveDatabase(const std::string& path, const fd::FaceDatabase& db) {
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    if (!out) {
-        return false;
-    }
-    out.write(kDbMagic, sizeof(kDbMagic));
-    const auto count = static_cast<std::uint32_t>(db.entries().size());
-    out.write(reinterpret_cast<const char*>(&count), sizeof(count));
-    for (const fd::FaceDatabase::Entry& entry : db.entries()) {
-        const auto person_id = static_cast<std::int32_t>(entry.person_id);
-        out.write(reinterpret_cast<const char*>(&person_id), sizeof(person_id));
-        out.write(reinterpret_cast<const char*>(entry.embedding.values.data()),
-                  static_cast<std::streamsize>(sizeof(float) *
-                                               fd::Embedding::kDimension));
-    }
-    return out.good();
-}
-
 void printHelp() {
     std::cout
         << "face-detection-app -- detect faces in an image\n"
@@ -263,7 +205,7 @@ int main(int argc, char** argv) {
     // A database may be loaded even without --enroll/--recognize, so that
     // its contents can be inspected.
     fd::FaceDatabase db;
-    if (!db_path.empty() && loadDatabase(db_path, db)) {
+    if (!db_path.empty() && db.load(db_path)) {
         std::cout << "Loaded " << db.size() << " enrolment(s) from " << db_path
                   << '\n';
     }
@@ -303,7 +245,7 @@ int main(int argc, char** argv) {
             db.enroll(person_id, embedding);
             std::cout << "Enrolled the first face under person id " << person_id
                       << " (database now holds " << db.size() << ").\n";
-            if (!db_path.empty() && !saveDatabase(db_path, db)) {
+            if (!db_path.empty() && !db.save(db_path)) {
                 std::cerr << "Could not write the database to " << db_path << '\n';
                 return 1;
             }

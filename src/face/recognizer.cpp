@@ -91,7 +91,13 @@ FaceRecognizer& FaceRecognizer::operator=(FaceRecognizer&&) noexcept = default;
 
 bool FaceRecognizer::open(const Options& options) {
 #ifdef FD_HAVE_FACE_STACK
-    impl_->recognizer = cv::FaceRecognizerSF::create(options.model_path, "");
+    try {
+        impl_->recognizer = cv::FaceRecognizerSF::create(options.model_path, "");
+    } catch (const cv::Exception&) {
+        // See FaceDetector::open(): failure is reported by returning false.
+        impl_->recognizer = nullptr;
+        return false;
+    }
     return impl_->recognizer != nullptr;
 #else
     (void)options;

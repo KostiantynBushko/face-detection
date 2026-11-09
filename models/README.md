@@ -29,6 +29,14 @@ model directory in this order:
 2. `$FACE_DETECTION_MODELS` environment variable
 3. `./models` relative to the working directory
 
+Step 3 is relative to the **working directory**, not to the executable, so the
+app has to be launched from the directory that holds `models/` — or given an
+explicit path. Otherwise OpenCV reports:
+
+```text
+Can't read ONNX file: models/face_detection_yunet_2023mar.onnx
+```
+
 ## Note on the SFace training data
 
 SFace was trained on VGGFace2. The *weights* are Apache 2.0, but if you ship

@@ -69,6 +69,21 @@ public:
     /// All enrolled entries, in insertion order.
     [[nodiscard]] const std::vector<Entry>& entries() const { return entries_; }
 
+    /// Persists the database to @p path.
+    ///
+    /// The on-disk format is deliberately trivial:
+    ///   magic "FDB1" | uint32 count | { int32 person_id, float[128] } * count
+    /// Only embeddings are stored, never photographs.
+    ///
+    /// Returns false if the file could not be written.
+    bool save(const std::string& path) const;
+
+    /// Loads the entries stored in @p path and appends them to the database.
+    ///
+    /// Returns false if the file does not exist or is not a valid database.
+    /// The database is left untouched in that case.
+    bool load(const std::string& path);
+
 private:
     std::vector<Entry> entries_;
 };
