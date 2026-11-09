@@ -1,0 +1,19 @@
+# Build directories
+build/
+
+# CMake / compiler metadata
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+*.ninja
+
+# Downloaded model weights (fetched by models/fetch.sh, never committed)
+models/*.onnx
+models/*.bin
+
+# Editor / OS cruft
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
