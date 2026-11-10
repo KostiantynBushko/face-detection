@@ -16,7 +16,10 @@
 #include "face-detection/face/recognizer.hpp"
 #include "face-detection/face/store.hpp"
 #include "face-detection/image.hpp"
+#include "face-detection/json.hpp"
 
+#include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -37,7 +40,7 @@ bool isBooleanOption(const std::string& name) {
 bool isKnownOption(const std::string& name) {
     static const char* const kOptions[] = {
         "image", "models", "threshold", "db", "enroll", "recognize",
-        "db-list", "db-remove", "help",
+        "db-list", "db-remove", "enroll-name", "enroll-metadata", "help",
     };
     for (const char* known : kOptions) {
         if (name == known) {
@@ -70,6 +73,32 @@ bool flag(int argc, char** argv, const std::string& name) {
     return false;
 }
 
+#ifdef FD_HAVE_FACE_STACK
+// Encodes the detected face as a JPEG, so that a human can recognise the
+// person later on. Returns an empty vector when the face could not be
+// encoded.
+std::vector<std::uint8_t> encodeFace(const cv::Mat& source,
+                                      const fd::FaceBox& face) {
+    // A little padding around the box: the edges of a face carry
+    // information as well.
+    const int pad = std::max(face.width, face.height) / 4;
+    const int x = std::max(0, face.x - pad);
+    const int y = std::max(0, face.y - pad);
+    const int width = std::min(source.cols - x, face.width + 2 * pad);
+    const int height = std::min(source.rows - y, face.height + 2 * pad);
+    if (width <= 0 || height <= 0) {
+        return {};
+    }
+
+    const cv::Mat crop = source(cv::Rect(x, y, width, height));
+    std::vector<uchar> buffer;
+    if (!cv::imencode(".jpg", crop, buffer, {cv::IMWRITE_JPEG_QUALITY, 85})) {
+        return {};
+    }
+    return std::vector<std::uint8_t>(buffer.begin(), buffer.end());
+}
+#endif
+
 // ---------------------------------------------------------------------------
 void printHelp() {
     std::cout
@@ -97,6 +126,12 @@ void printHelp() {
            "                       Needs --db.\n"
            "  --enroll=<id>        Enrol the first detected face under this\n"
            "                       person id instead of just reporting it.\n"
+           "  --enroll-name=<name> The name of the person being enrolled. It\n"
+           "                       is stored with the sample and shown when\n"
+           "                       the person is recognised.\n"
+           "  --enroll-metadata=<json>\n"
+           "                       Extra properties of the person, as a JSON\n"
+           "                       document (e.g. {\"role\":\"admin\"}).\n"
            "  --recognize          Compare detected faces against the enrolled\n"
            "                       set and report the closest identity.\n"
            "  -h, --help           Print this text and exit.\n"
@@ -159,7 +194,9 @@ bool openDatabase(const std::string& target, std::unique_ptr<fd::FaceStore>& sto
     }
 
     for (const fd::FaceEntry& entry : entries) {
-        db.enroll(entry.person_id, entry.embedding);
+        // The whole entry is added, so that the name, the picture and the
+        // metadata of the person survive the reload.
+        db.add(entry);
     }
     std::cout << "Loaded " << entries.size() << " enrolment(s) from " << target
               << '\n';
@@ -181,6 +218,8 @@ int main(int argc, char** argv) {
     const std::string image_path = arg(argc, argv, "image", "");
     const std::string db_target = arg(argc, argv, "db", "");
     const std::string enroll_str = arg(argc, argv, "enroll", "");
+    const std::string enroll_name = arg(argc, argv, "enroll-name", "");
+    const std::string enroll_metadata = arg(argc, argv, "enroll-metadata", "");
     const std::string remove_str = arg(argc, argv, "db-remove", "");
     const bool list_only = flag(argc, argv, "db-list");
     const bool do_recognize = flag(argc, argv, "recognize");
@@ -213,7 +252,11 @@ int main(int argc, char** argv) {
             }
             for (const fd::PersonSummary& person : people) {
                 std::cout << "  person " << person.person_id << ": "
-                          << person.samples << " sample(s)\n";
+                          << person.samples << " sample(s)";
+                if (!person.user_name.empty()) {
+                    std::cout << " (" << person.user_name << ")";
+                }
+                std::cout << '\n';
             }
             return 0;
         }
@@ -238,6 +281,15 @@ int main(int argc, char** argv) {
 
     if (image_path.empty()) {
         std::cerr << "Missing required option --image=<path>.\n";
+        return 2;
+    }
+
+    // The metadata is stored in a JSON column, so it has to be a JSON
+    // document. It is checked here, because the error of the server is a
+    // lot harder to make sense of.
+    if (!enroll_metadata.empty() && !fd::isValidJson(enroll_metadata)) {
+        std::cerr << "Invalid --enroll-metadata value '" << enroll_metadata
+                  << "': not a JSON document.\n";
         return 2;
     }
 
@@ -347,13 +399,25 @@ int main(int argc, char** argv) {
                 return 1;
             }
 
+            // The properties of the person: the name that is shown when
+            // the person is recognised, the picture of the face and the
+            // metadata.
+            fd::EnrolmentInfo info;
+            info.user_name = enroll_name;
+            info.metadata = enroll_metadata;
+            info.photo = encodeFace(source, faces.front());
+
             fd::FaceEntry entry;
-            if (!db.enroll(person_id, embedding, &entry)) {
+            if (!db.enroll(person_id, embedding, info, &entry)) {
                 std::cerr << "Could not compute an embedding for the face.\n";
                 return 1;
             }
             std::cout << "Enrolled the first face under person id " << person_id
                       << " (database now holds " << db.size() << ").\n";
+            if (!info.photo.empty()) {
+                std::cout << "Stored a " << info.photo.size()
+                          << " byte picture of the face.\n";
+            }
 
             // The store appends the new sample on its own, so enrolling one
             // person never rewrites the samples of the others.
@@ -385,8 +449,11 @@ int main(int argc, char** argv) {
                 return 1;
             }
             const fd::FaceDatabase::Match result = db.match(embedding);
-            std::cout << "Best match: person=" << result.person_id
-                      << " distance=" << result.distance
+            std::cout << "Best match: person=" << result.person_id;
+            if (!result.user_name.empty()) {
+                std::cout << " (" << result.user_name << ")";
+            }
+            std::cout << " distance=" << result.distance
                       << " matched=" << (result.matched ? "yes" : "no") << '\n';
             return result.matched ? 0 : 1;
         }

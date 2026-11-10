@@ -108,13 +108,20 @@ recognizer.embed(image, faces.front(), embedding);   // 128-d, unit length
 fd::FaceDatabase database;
 database.enroll(/*person_id=*/42, image, faces.front(), recognizer);
 
+// The properties of the person: the name that is shown when the person
+// is recognised, a picture of the face and a JSON document.
+fd::EnrolmentInfo info;
+info.user_name = "Ada Lovelace";
+info.metadata = "{\"role\":\"admin\"}";
+database.enroll(/*person_id=*/42, image, faces.front(), recognizer, info);
+
 const fd::FaceDatabase::Match match = database.match(embedding);
 if (match.matched) {
     // match.person_id == 42
 }
 
-// Persist the enrolments. The database stores embeddings only, never
-// photographs, and the file format is shared with objective-control.
+// Persist the enrolments. The file format is shared with
+// objective-control.
 database.save("faces.db");
 database.load("faces.db");
 ```
@@ -139,6 +146,8 @@ store->load(entries, error);          // read every sample
 fd::FaceEntry entry;                  // append one sample
 entry.person_id = 42;
 entry.embedding = embedding;
+entry.info.user_name = "Ada Lovelace";
+entry.info.metadata = "{\"role\":\"admin\"}";
 store->add(entry, error);             // cheap: one INSERT
 
 store->remove(/*person_id=*/42, error);
@@ -148,12 +157,24 @@ Two implementations ship with the library:
 
 | Store               | Target                                    | Notes                                        |
 |---------------------|-------------------------------------------|----------------------------------------------|
-| `FileFaceStore`     | a file path                               | The flat `FDB1` binary format                |
+| `FileFaceStore`     | a file path                               | The flat `FDB2` binary format                |
 | `PostgresFaceStore` | `postgres://…` / `postgresql://…`         | A PostgreSQL table; needs libpq              |
 
 `makeFaceStore()` picks the backend from the target: a target that starts
 with `postgres://` or `postgresql://` is a PostgreSQL one, everything else is
 a file.
+
+The file store writes the `FDB2` format:
+
+```text
+magic "FDB2" | uint32 count | entry * count
+entry := int32 person_id | float[128] | uint32 name_len | name bytes
+       | uint32 photo_len | photo bytes | uint32 meta_len | meta bytes
+```
+
+The older `FDB1` format -- the person id and the embedding, nothing else
+-- is still read, so a database written by an earlier version keeps
+working. It is never written any more.
 
 The PostgreSQL store keeps one row per sample:
 
@@ -162,17 +183,50 @@ CREATE TABLE face_enrollments (
     id          bigserial   PRIMARY KEY,
     person_id   integer     NOT NULL,
     embedding   real[]      NOT NULL,
+    user_name   text,
+    photo       bytea,
+    metadata    jsonb       NOT NULL DEFAULT '{}'::jsonb,
     enrolled_at timestamptz NOT NULL DEFAULT now()
 );
 ```
+
+The three optional columns hold the properties of the person a sample
+belongs to:
+
+| Column      | Type    | What it holds                                              |
+|-------------|---------|------------------------------------------------------------|
+| `user_name` | `text`  | The name that is shown on screen when the person is detected |
+| `photo`     | `bytea` | A picture of the face, as the bytes of an encoded image      |
+| `metadata`  | `jsonb` | An arbitrary JSON document with whatever the application wants to remember |
+
+The properties are stored with **every** sample of a person, so a store
+can answer "who is this?" without a second lookup. The columns were added
+after the table was introduced, so a table that predates them is migrated
+when the store creates the schema -- and a table that cannot be altered
+is used as it is, without the properties.
+
+`PostgresFaceStore::missingPropertyColumns()` names the columns that the
+table does not have, so that an application can tell the user that the
+name, the picture and the metadata are not stored.
+`PostgresFaceStore::createSchema()` -- and `FaceStore::prepareSchema()`,
+which every store has -- report every problem they run into, which is
+what a deployment that prepares the schema wants. `open()` only reports
+what it cannot work with at all.
 
 The table is created when the store connects; [`sql/schema.sql`](sql/schema.sql)
 holds the same DDL for deployments that prepare the schema separately. The
 connection uses libpq, so `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER` and
 `PGPASSWORD` apply whenever the connection string does not spell them out.
 
-Only the embedding is stored — never the photograph it was computed from —
-so the table stays small and does not duplicate biometric source material.
+The picture is optional: a sample without one still matches perfectly
+well, and the table does not have to hold biometric source material when
+nobody looks at it.
+
+The metadata is stored in a `jsonb` column, so the server checks it and
+reformats it -- a document that was written as `{"role":"admin"}` comes
+back as `{"role": "admin"}`. The library checks the documents itself as
+well (`fd::isValidJson`), so an invalid one is reported with a readable
+message instead of a server error.
 
 ### Key types
 
@@ -183,7 +237,7 @@ so the table stays small and does not duplicate biometric source material.
 | `fd::Embedding`   | 128-dimensional, L2-normalised feature vector.                          |
 | `fd::FaceDatabase`| Enrolled embeddings keyed by an application-defined person id. `save`/`load` persist them. |
 | `fd::FaceStore`    | Where the enrolled samples are kept — a file or a PostgreSQL table. |
-| `fd::FaceEntry`    | One enrolled sample: a person id and its embedding. |
+| `fd::FaceEntry`    | One enrolled sample: a person id, its embedding and the properties of the person. |
 
 ### Distance semantics
 
@@ -269,6 +323,10 @@ stack in two independent steps.
 ./build/debug/bin/face-detection-app --image=photo.jpg --db=faces.db --enroll=42
 ./build/debug/bin/face-detection-app --image=photo.jpg --db=faces.db --recognize
 
+# ... with a name and some metadata
+./build/debug/bin/face-detection-app --image=photo.jpg --db=faces.db \
+    --enroll=42 --enroll-name="Ada Lovelace" --enroll-metadata='{"role":"admin"}'
+
 # The same, but with the enrolments in PostgreSQL
 ./build/debug/bin/face-detection-app --image=photo.jpg \
     --db=postgres://user@localhost/faces --enroll=42
@@ -287,6 +345,8 @@ stack in two independent steps.
 | `--db-list`       | *(off)*              | List the enrolled people and exit           |
 | `--db-remove=<id>`| *(none)*             | Remove every sample of a person and exit    |
 | `--enroll=<id>`   | *(none)*             | Enrol the first detected face under this id |
+| `--enroll-name=<name>` | *(none)*       | The name of the person being enrolled; stored with the sample and shown when the person is recognised |
+| `--enroll-metadata=<json>` | *(none)* | Extra properties of the person, as a JSON document |
 | `--recognize`     | *(off)*              | Match against the enrolled set             |
 | `-h`, `--help`    | —                    | Print the option list                       |
 

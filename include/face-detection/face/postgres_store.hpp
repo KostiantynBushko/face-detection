@@ -16,12 +16,22 @@ namespace fd {
 ///       id          bigserial   PRIMARY KEY,
 ///       person_id   integer     NOT NULL,
 ///       embedding   real[]      NOT NULL,
+///       user_name   text,
+///       photo       bytea,
+///       metadata    jsonb       NOT NULL DEFAULT '{}'::jsonb,
 ///       enrolled_at timestamptz NOT NULL DEFAULT now()
 ///   );
 ///
 /// The embedding is a 128-element array of `real` (single-precision float),
-/// which is exactly what SFace produces. The photograph the embedding was
-/// computed from is never stored.
+/// which is exactly what SFace produces.
+///
+/// The three optional columns hold the properties of the person a sample
+/// belongs to: the name that is shown on screen when the person is
+/// detected, a picture of the face and a JSON document with whatever the
+/// application wants to remember. They were added after the table was
+/// introduced, so a table that predates them is migrated when the store
+/// creates the schema -- and a table that cannot be altered is used as it
+/// is, without the properties.
 ///
 /// The connection is made with libpq, so the usual environment variables
 /// (PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD) apply whenever the
@@ -70,14 +80,40 @@ public:
     int remove(int person_id, std::string& error) override;
     bool list(std::vector<PersonSummary>& people, std::string& error) override;
 
-    /// Creates the table and its index if they are missing.
+    /// The properties of a person that the table cannot keep.
+    ///
+    /// The names of the missing columns are returned: "user_name",
+    /// "photo" and "metadata". A table that predates them and that the
+    /// runtime user is not allowed to alter is used as it is, so the
+    /// properties are dropped on the way in.
+    [[nodiscard]] std::vector<std::string>
+    missingPropertyColumns() const override;
+
+    /// Creates the table and its index if they are missing, and adds the
+    /// columns that were introduced later to a table that is already
+    /// there.
     ///
     /// Called by open() unless Options::create_schema is false. Exposed on
     /// its own so that a deployment can prepare the schema with a user that
     /// is not allowed to create tables at run time.
+    ///
+    /// Unlike open(), this reports every problem it runs into: a column
+    /// that could not be added is an error here, while open() goes on
+    /// without the properties of a person.
     bool createSchema(std::string& error);
 
+    /// Prepares the schema and reports every problem it runs into.
+    bool prepareSchema(std::string& error) override;
+
 private:
+    /// Creates the table, its index and the columns that were introduced
+    /// later.
+    ///
+    /// @p tolerant makes the store work with a table that it is not
+    /// allowed to alter: the properties of a person are then not stored.
+    /// The table itself has to be there in either case.
+    bool ensureSchema(std::string& error, bool tolerant);
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

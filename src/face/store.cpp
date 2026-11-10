@@ -1,11 +1,13 @@
 #include "face-detection/face/store.hpp"
 
 #include "face-detection/face/postgres_store.hpp"
+#include "face-detection/json.hpp"
 
 #include <algorithm>
 #include <cstdint>
 #include <fstream>
 #include <limits>
+#include <string>
 #include <utility>
 
 namespace fd {
@@ -13,8 +15,68 @@ namespace fd {
 namespace {
 
 // The on-disk format is deliberately trivial:
-//   magic "FDB1" | uint32 count | { int32 person_id, float[128] } * count
-constexpr char kDbMagic[4] = {'F', 'D', 'B', '1'};
+//   magic "FDB2" | uint32 count | entry * count
+//   entry := int32 person_id | float[128] | uint32 name_len | name bytes
+//          | uint32 photo_len | photo bytes | uint32 meta_len | meta bytes
+constexpr char kDbMagic[4] = {'F', 'D', 'B', '2'};
+
+// The format before the properties were added. It only held the person
+// id and the embedding, and is still read so that a database written by
+// an earlier version keeps working.
+constexpr char kLegacyDbMagic[4] = {'F', 'D', 'B', '1'};
+
+// The largest blob a file may hold. A corrupt length would otherwise
+// make the reader allocate gigabytes.
+constexpr std::uint32_t kMaxBlobSize = 64u * 1024u * 1024u;
+
+/// Reads a length-prefixed blob.
+bool readBlob(std::istream& in, std::string& blob) {
+    std::uint32_t size = 0;
+    in.read(reinterpret_cast<char*>(&size), sizeof(size));
+    if (!in) {
+        return false;
+    }
+    if (size > kMaxBlobSize) {
+        return false;
+    }
+    blob.assign(size, '\0');
+    if (size == 0) {
+        return true;
+    }
+    in.read(blob.data(), static_cast<std::streamsize>(size));
+    return static_cast<bool>(in);
+}
+
+/// Reads a length-prefixed blob of bytes.
+bool readBlob(std::istream& in, std::vector<std::uint8_t>& blob) {
+    std::string bytes;
+    if (!readBlob(in, bytes)) {
+        return false;
+    }
+    blob.assign(bytes.begin(), bytes.end());
+    return true;
+}
+
+/// Writes a length-prefixed blob.
+bool writeBlob(std::ostream& out, const std::string& blob) {
+    const auto size = static_cast<std::uint32_t>(blob.size());
+    out.write(reinterpret_cast<const char*>(&size), sizeof(size));
+    if (size > 0) {
+        out.write(blob.data(), static_cast<std::streamsize>(size));
+    }
+    return static_cast<bool>(out);
+}
+
+/// Writes a length-prefixed blob of bytes.
+bool writeBlob(std::ostream& out, const std::vector<std::uint8_t>& blob) {
+    const auto size = static_cast<std::uint32_t>(blob.size());
+    out.write(reinterpret_cast<const char*>(&size), sizeof(size));
+    if (size > 0) {
+        out.write(reinterpret_cast<const char*>(blob.data()),
+                  static_cast<std::streamsize>(size));
+    }
+    return static_cast<bool>(out);
+}
 
 } // namespace
 
@@ -66,15 +128,31 @@ bool FaceStore::list(std::vector<PersonSummary>& people, std::string& error) {
                                    return summary.person_id == entry.person_id;
                                });
         if (it == people.end()) {
-            people.push_back(PersonSummary{entry.person_id, 1});
+            people.push_back(
+                PersonSummary{entry.person_id, 1, entry.info.user_name});
         } else {
             ++it->samples;
+            if (it->user_name.empty()) {
+                it->user_name = entry.info.user_name;
+            }
         }
     }
     std::sort(people.begin(), people.end(),
               [](const PersonSummary& a, const PersonSummary& b) {
                   return a.person_id < b.person_id;
               });
+    return true;
+}
+
+std::vector<std::string> FaceStore::missingPropertyColumns() const {
+    // The file store keeps every property of a person, so there is never
+    // one that is missing.
+    return {};
+}
+
+bool FaceStore::prepareSchema(std::string& error) {
+    // The file store is a plain file: there is no schema to prepare.
+    (void)error;
     return true;
 }
 
@@ -111,8 +189,15 @@ FileFaceStore::LoadResult FileFaceStore::readEntries(
 
     char magic[sizeof(kDbMagic)] = {};
     in.read(magic, sizeof(magic));
-    if (!in ||
-        std::string(magic, sizeof(magic)) != std::string(kDbMagic, sizeof(kDbMagic))) {
+    if (!in) {
+        error = "truncated face database file";
+        return LoadResult::Invalid;
+    }
+    const bool legacy = std::string(magic, sizeof(magic)) ==
+                        std::string(kLegacyDbMagic, sizeof(kLegacyDbMagic));
+    if (!legacy &&
+        std::string(magic, sizeof(magic)) !=
+            std::string(kDbMagic, sizeof(kDbMagic))) {
         error = "not a face database file (bad magic)";
         return LoadResult::Invalid;
     }
@@ -141,6 +226,18 @@ FileFaceStore::LoadResult FileFaceStore::readEntries(
         FaceEntry entry;
         entry.person_id = person_id;
         entry.embedding = embedding;
+
+        if (!legacy) {
+            // The properties of the person come after the embedding.
+            if (!readBlob(in, entry.info.user_name) ||
+                !readBlob(in, entry.info.photo) ||
+                !readBlob(in, entry.info.metadata)) {
+                error = "truncated face database file";
+                out.clear();
+                return LoadResult::Invalid;
+            }
+        }
+
         out.push_back(std::move(entry));
     }
     return LoadResult::Ok;
@@ -207,9 +304,13 @@ bool FileFaceStore::list(std::vector<PersonSummary>& people,
                                    return summary.person_id == entry.person_id;
                                });
         if (it == people.end()) {
-            people.push_back(PersonSummary{entry.person_id, 1});
+            people.push_back(
+                PersonSummary{entry.person_id, 1, entry.info.user_name});
         } else {
             ++it->samples;
+            if (it->user_name.empty()) {
+                it->user_name = entry.info.user_name;
+            }
         }
     }
     std::sort(people.begin(), people.end(),
@@ -227,6 +328,19 @@ bool FileFaceStore::save(const std::vector<FaceEntry>& entries,
         return false;
     }
 
+    // The metadata has to be a JSON document: the PostgreSQL store would
+    // refuse anything else, and the two stores should not disagree about
+    // what they accept.
+    for (const FaceEntry& entry : entries) {
+        if (!entry.info.metadata.empty() &&
+            !isValidJson(entry.info.metadata)) {
+            error = "the metadata of person " +
+                    std::to_string(entry.person_id) +
+                    " is not a valid JSON document";
+            return false;
+        }
+    }
+
     out.write(kDbMagic, sizeof(kDbMagic));
     const auto count = static_cast<std::uint32_t>(entries.size());
     out.write(reinterpret_cast<const char*>(&count), sizeof(count));
@@ -236,6 +350,12 @@ bool FileFaceStore::save(const std::vector<FaceEntry>& entries,
         out.write(reinterpret_cast<const char*>(entry.embedding.values.data()),
                   static_cast<std::streamsize>(sizeof(float) *
                                                Embedding::kDimension));
+        if (!writeBlob(out, entry.info.user_name) ||
+            !writeBlob(out, entry.info.photo) ||
+            !writeBlob(out, entry.info.metadata)) {
+            error = "could not write the face database file";
+            return false;
+        }
     }
     if (!out.good()) {
         error = "could not write the face database file";

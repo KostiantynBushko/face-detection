@@ -9,9 +9,11 @@
 #include "face-detection/face/recognizer.hpp"
 #include "face-detection/face/store.hpp"
 #include "face-detection/image.hpp"
+#include "face-detection/json.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
@@ -62,6 +64,45 @@ fd::Embedding makeEmbeddingOnAxis(std::size_t axis) {
     e.values[axis] = 1.0f;
     e.valid = true;
     return e;
+}
+
+/// Removes the whitespace of a JSON document.
+///
+/// The server reformats the metadata it stores -- a jsonb column comes
+/// back as "{\"role\": \"admin\"}" whatever was written -- so the two
+/// documents are compared without their whitespace.
+std::string withoutSpaces(const std::string& text) {
+    std::string out;
+    for (const char c : text) {
+        if (c != ' ' && c != '\n' && c != '\t' && c != '\r') {
+            out.push_back(c);
+        }
+    }
+    return out;
+}
+
+/// Writes a face database in the format of an earlier version: the
+/// person id and the embedding, nothing else.
+bool writeLegacyFile(const std::string& path, int person_id,
+                     const fd::Embedding& embedding) {
+    std::FILE* file = std::fopen(path.c_str(), "wb");
+    if (file == nullptr) {
+        return false;
+    }
+
+    const char magic[4] = {'F', 'D', 'B', '1'};
+    const std::uint32_t count = 1;
+    const auto id = static_cast<std::int32_t>(person_id);
+
+    const bool ok =
+        std::fwrite(magic, 1, sizeof(magic), file) == sizeof(magic) &&
+        std::fwrite(&count, sizeof(count), 1, file) == 1 &&
+        std::fwrite(&id, sizeof(id), 1, file) == 1 &&
+        std::fwrite(embedding.values.data(), sizeof(float),
+                    fd::Embedding::kDimension, file) ==
+            fd::Embedding::kDimension;
+    std::fclose(file);
+    return ok;
 }
 
 #ifdef FD_HAVE_POSTGRES
@@ -117,6 +158,92 @@ bool runCommand(const std::string& dsn, const std::string& sql) {
     }
     PQfinish(conn);
     return ok;
+}
+
+/// Runs @p sql and returns the first column of the first row as a string.
+/// Returns an empty string when the query fails.
+std::string queryScalarNoParam(const std::string& dsn, const std::string& sql) {
+    PGconn* conn = PQconnectdb(dsn.c_str());
+    if (conn == nullptr) {
+        return {};
+    }
+    PGresult* result = PQexec(conn, sql.c_str());
+    std::string value;
+    if (result != nullptr && PQresultStatus(result) == PGRES_TUPLES_OK &&
+        PQntuples(result) > 0 && !PQgetisnull(result, 0, 0)) {
+        value = PQgetvalue(result, 0, 0);
+    }
+    if (result != nullptr) {
+        PQclear(result);
+    }
+    PQfinish(conn);
+    return value;
+}
+
+/// Builds a connection string for another user of the same database.
+///
+/// Both the keyword form ("host=... dbname=...") and the URL form
+/// ("postgres://user:pass@host/db") are understood. The name of the
+/// database is always spelled out, because it would otherwise default to
+/// the name of the user.
+std::string dsnForUser(const std::string& dsn, const std::string& user,
+                       const std::string& password,
+                       const std::string& database) {
+    const std::size_t scheme = dsn.find("://");
+    if (scheme != std::string::npos) {
+        // The URL form: everything behind the "@" is the host.
+        std::string authority = dsn.substr(scheme + 3);
+        std::string tail;
+        const std::size_t slash = authority.find('/');
+        if (slash != std::string::npos) {
+            tail = authority.substr(slash);
+            authority = authority.substr(0, slash);
+        }
+        const std::size_t at = authority.find('@');
+        if (at != std::string::npos) {
+            authority = authority.substr(at + 1);
+        }
+        // The query string of the original DSN is kept.
+        const std::size_t question = tail.find('?');
+        const std::string query =
+            (question == std::string::npos) ? std::string()
+                                             : tail.substr(question);
+        return dsn.substr(0, scheme + 3) + user + ":" + password + "@" +
+               authority + "/" + database + query;
+    }
+
+    // The keyword form: the tokens are copied, except for the ones that
+    // are replaced.
+    std::string out;
+    std::size_t start = 0;
+    while (start <= dsn.size()) {
+        std::size_t end = dsn.find(' ', start);
+        if (end == std::string::npos) {
+            end = dsn.size();
+        }
+        const std::string token = dsn.substr(start, end - start);
+        if (!token.empty()) {
+            const bool replaced =
+                token.rfind("user=", 0) == 0 ||
+                token.rfind("password=", 0) == 0 ||
+                token.rfind("dbname=", 0) == 0;
+            if (!replaced) {
+                if (!out.empty()) {
+                    out += " ";
+                }
+                out += token;
+            }
+        }
+        if (end == dsn.size()) {
+            break;
+        }
+        start = end + 1;
+    }
+    if (!out.empty()) {
+        out += " ";
+    }
+    out += "user=" + user + " password=" + password + " dbname=" + database;
+    return out;
 }
 
 /// Drops the table @p table, if it is there.
@@ -211,6 +338,83 @@ int main() {
         check(!db.enroll(1, invalid), "enroll rejects an invalid embedding");
     }
 
+    // ---- the name of a person comes back with the match -------------------
+    {
+        using fd::EnrolmentInfo;
+        using fd::FaceEntry;
+
+        FaceDatabase db;
+
+        EnrolmentInfo info;
+        info.user_name = "Ada Lovelace";
+        info.metadata = "{\"role\":\"admin\"}";
+        check(db.enroll(42, makeEmbeddingOnAxis(0), info),
+              "enroll accepts the properties of a person");
+
+        const auto hit = db.match(makeEmbeddingOnAxis(0), 0.4f);
+        check(hit.matched, "the enrolled person is matched");
+        check(hit.person_id == 42, "the person id is reported");
+        check(hit.user_name == "Ada Lovelace",
+              "the name of the person comes back with the match");
+
+        // A sample that was read from a store keeps its properties.
+        FaceEntry entry;
+        entry.person_id = 43;
+        entry.embedding = makeEmbeddingOnAxis(1);
+        entry.info.user_name = "Alan Turing";
+        check(db.add(entry), "a sample of a store is added");
+        const auto other = db.match(makeEmbeddingOnAxis(1), 0.4f);
+        check(other.user_name == "Alan Turing",
+              "the name of a reloaded sample comes back as well");
+    }
+
+    // ---- the JSON validator -----------------------------------------------
+    {
+        static const char* const kValid[] = {
+            "{}",
+            "[]",
+            "null",
+            "true",
+            "false",
+            "0",
+            "-1",
+            "1.5",
+            "-2.5e10",
+            "\"text\"",
+            "{\"a\":1}",
+            "[1,2,3]",
+            "{\"a\":{\"b\":[1,{\"c\":null}]}}",
+            "{\"a\":\"quote \\\" and backslash \\\\\"}",
+        };
+        for (const char* document : kValid) {
+            check(fd::isValidJson(document),
+                  (std::string("a valid JSON document is accepted: ") +
+                   document).c_str());
+        }
+
+        static const char* const kInvalid[] = {
+            "",
+            " ",
+            "{",
+            "}",
+            "[1,]",
+            "{\"a\":1,}",
+            "{a:1}",
+            "{\"a\"}",
+            "{\"a\":}",
+            "tru",
+            "01",
+            "\"unterminated",
+            "{'a':1}",
+            "{} trailing",
+        };
+        for (const char* document : kInvalid) {
+            check(!fd::isValidJson(document),
+                  (std::string("an invalid JSON document is rejected: ") +
+                   document).c_str());
+        }
+    }
+
     // ---- FaceStore --------------------------------------------------------
     {
         using fd::FaceEntry;
@@ -299,6 +503,104 @@ int main() {
         std::remove(path.c_str());
     }
 
+    // ---- the file store keeps the properties of a person -------------------
+    {
+        using fd::FaceEntry;
+        using fd::FileFaceStore;
+        using fd::PersonSummary;
+
+        std::string error;
+        const std::string path = "face_store_properties_test.db";
+        std::remove(path.c_str());
+        {
+            FileFaceStore file_store;
+            check(file_store.open(path, error), "the file store opens");
+
+            FaceEntry entry;
+            entry.person_id = 21;
+            entry.embedding = makeEmbeddingOnAxis(0);
+            entry.info.user_name = "Ada Lovelace";
+            entry.info.metadata = "{\"role\":\"admin\"}";
+            entry.info.photo = {0xff, 0xd8, 0xff, 0x00, 0x7f};
+            check(file_store.add(entry, error),
+                  "the file store adds a sample with properties");
+
+            // A sample without any property is fine as well.
+            FaceEntry plain;
+            plain.person_id = 22;
+            plain.embedding = makeEmbeddingOnAxis(1);
+            check(file_store.add(plain, error),
+                  "the file store adds a sample without properties");
+        }
+        {
+            FileFaceStore file_store;
+            check(file_store.open(path, error), "the file store reopens");
+            std::vector<FaceEntry> loaded;
+            check(file_store.load(loaded, error), "the file store loads");
+            check(loaded.size() == 2, "both samples are in the file");
+            for (const FaceEntry& entry : loaded) {
+                if (entry.person_id == 21) {
+                    check(entry.info.user_name == "Ada Lovelace",
+                          "the name of the person survived the round trip");
+                    check(withoutSpaces(entry.info.metadata) ==
+                              withoutSpaces("{\"role\":\"admin\"}"),
+                          "the metadata of the person survived the round trip");
+                    check(entry.info.photo.size() == 5 &&
+                              entry.info.photo[0] == 0xff &&
+                              entry.info.photo[4] == 0x7f,
+                          "the picture of the person survived the round trip");
+                } else if (entry.person_id == 22) {
+                    check(entry.info.user_name.empty(),
+                          "a sample without a name stays without one");
+                    check(entry.info.metadata.empty(),
+                          "a sample without metadata stays without one");
+                    check(entry.info.photo.empty(),
+                          "a sample without a picture stays without one");
+                }
+            }
+
+            std::vector<PersonSummary> people;
+            check(file_store.list(people, error), "the file store lists");
+            check(people.size() == 2, "two people are listed");
+            for (const PersonSummary& person : people) {
+                if (person.person_id == 21) {
+                    check(person.user_name == "Ada Lovelace",
+                          "the list carries the name of the person");
+                }
+            }
+        }
+        std::remove(path.c_str());
+    }
+
+    // ---- the file store reads the format of an earlier version -------------
+    {
+        using fd::FaceEntry;
+        using fd::FileFaceStore;
+
+        std::string error;
+        const std::string path = "face_store_legacy_test.db";
+        std::remove(path.c_str());
+        const fd::Embedding embedding = makeEmbeddingOnAxis(0);
+        check(writeLegacyFile(path, 31, embedding),
+              "a database of an earlier version is written");
+
+        FileFaceStore file_store;
+        check(file_store.open(path, error), "the file store opens");
+        std::vector<FaceEntry> loaded;
+        check(file_store.load(loaded, error),
+              "the file store reads a database of an earlier version");
+        check(loaded.size() == 1, "the old sample is read");
+        if (loaded.size() == 1) {
+            check(loaded[0].person_id == 31,
+                  "the old sample kept its person id");
+            check(loaded[0].embedding.valid,
+                  "the old sample kept its embedding");
+            check(loaded[0].info.user_name.empty(),
+                  "the old sample has no name");
+        }
+        std::remove(path.c_str());
+    }
+
     // ---- PostgreSQL store --------------------------------------------------
     // The database tests need a server, so they only run when one is named
     // in the environment. Everything else stays database-free.
@@ -338,6 +640,16 @@ int main() {
             check(addedAgain,
                   "the PostgreSQL store adds a second sample of the person");
 
+            // The properties of a person travel with the sample.
+            FaceEntry named;
+            named.person_id = 9003;
+            named.embedding = makeEmbeddingOnAxis(2);
+            named.info.user_name = "Grace Hopper";
+            named.info.metadata = "{\"role\":\"admin\"}";
+            named.info.photo = {0xff, 0xd8, 0xff, 0x00, 0x7f};
+            check(pg.add(named, error),
+                  "the PostgreSQL store adds a sample with properties");
+
             std::vector<FaceEntry> loaded;
             const bool loadedOk = pg.load(loaded, error);
             check(loadedOk, ("the PostgreSQL store loads: " + error).c_str());
@@ -358,6 +670,23 @@ int main() {
             check(found == 2, "both samples of the person come back");
             check(exact, "the embedding survives the round trip unchanged");
 
+            // The properties of the person come back as well.
+            bool properties = false;
+            for (const FaceEntry& entry : loaded) {
+                if (entry.person_id != 9003) {
+                    continue;
+                }
+                properties = entry.info.user_name == "Grace Hopper" &&
+                             withoutSpaces(entry.info.metadata) ==
+                                 withoutSpaces("{\"role\":\"admin\"}") &&
+                             entry.info.photo.size() == 5 &&
+                             entry.info.photo[0] == 0xff &&
+                             entry.info.photo[4] == 0x7f;
+            }
+            check(properties,
+                  "the name, the picture and the metadata survive the round "
+                  "trip");
+
             std::vector<PersonSummary> people;
             const bool listedOk = pg.list(people, error);
             check(listedOk, "the PostgreSQL store lists");
@@ -373,11 +702,193 @@ int main() {
                   "the PostgreSQL store removes both samples");
             check(pg.remove(9001, error) == 0,
                   "removing an unknown person removes nothing");
+            check(pg.remove(9003, error) == 1,
+                  "the PostgreSQL store removes the sample with properties");
 
             pg.close();
             check(!pg.isOpen(), "the PostgreSQL store reports closed");
         }
     }
+
+    // ---- PostgreSQL store: a table of an earlier version is migrated ----
+#ifdef FD_HAVE_POSTGRES
+    {
+        const char* dsn = std::getenv("FACE_DETECTION_TEST_DSN");
+        if (dsn != nullptr && *dsn != '\0' && fd::postgresAvailable()) {
+            using fd::FaceEntry;
+            using fd::PostgresFaceStore;
+
+            const std::string table = "face_enrollments_legacy_test";
+            dropTable(dsn, table);
+
+            // A table of the shape the store used to create: no name, no
+            // picture and no metadata.
+            runCommand(dsn,
+                       "CREATE TABLE \"" + table + "\" ("
+                       "id bigserial PRIMARY KEY, "
+                       "person_id integer NOT NULL, "
+                       "embedding real[] NOT NULL, "
+                       "enrolled_at timestamptz NOT NULL DEFAULT now())");
+
+            PostgresFaceStore pg;
+            PostgresFaceStore::Options options;
+            options.table = table;
+            pg.setOptions(options);
+
+            std::string error;
+            check(pg.open(dsn, error),
+                  ("the store opens on a table of an earlier version: " +
+                   error).c_str());
+
+            check(queryScalar(dsn,
+                              "SELECT count(*) FROM "
+                              "information_schema.columns WHERE "
+                              "table_name = $1 AND column_name = 'user_name'",
+                              table) == "1",
+                  "the name column is added to the old table");
+            check(queryScalar(dsn,
+                              "SELECT count(*) FROM "
+                              "information_schema.columns WHERE "
+                              "table_name = $1 AND column_name = 'photo'",
+                              table) == "1",
+                  "the picture column is added to the old table");
+            check(queryScalar(dsn,
+                              "SELECT count(*) FROM "
+                              "information_schema.columns WHERE "
+                              "table_name = $1 AND column_name = 'metadata'",
+                              table) == "1",
+                  "the metadata column is added to the old table");
+
+            // The migrated table holds the samples with their properties.
+            FaceEntry entry;
+            entry.person_id = 41;
+            entry.embedding = makeEmbeddingOnAxis(0);
+            entry.info.user_name = "Alan Turing";
+            entry.info.metadata = "{\"role\":\"admin\"}";
+            check(pg.add(entry, error),
+                  ("the migrated table accepts a sample: " + error).c_str());
+
+            std::vector<FaceEntry> loaded;
+            check(pg.load(loaded, error),
+                  ("the migrated table loads: " + error).c_str());
+            bool found = false;
+            for (const FaceEntry& sample : loaded) {
+                if (sample.person_id == 41) {
+                    found = sample.info.user_name == "Alan Turing";
+                }
+            }
+            check(found, "the migrated table keeps the name of the person");
+
+            dropTable(dsn, table);
+        }
+    }
+#endif
+
+    // ---- PostgreSQL store: a table that may not be altered ---------------
+#ifdef FD_HAVE_POSTGRES
+    {
+        const char* dsn = std::getenv("FACE_DETECTION_TEST_DSN");
+        if (dsn != nullptr && *dsn != '\0' && fd::postgresAvailable()) {
+            // The scenario needs a second role that may not alter the
+            // table, so it only runs when the test connects as a
+            // superuser.
+            const bool superuser = queryScalarNoParam(
+                                       dsn,
+                                       "SELECT rolsuper FROM pg_roles "
+                                       "WHERE rolname = current_user") == "t";
+            if (superuser) {
+                using fd::FaceEntry;
+                using fd::PostgresFaceStore;
+
+                const std::string role = "fd_test_limited";
+                const std::string password = "fd_test_limited_pw";
+                const std::string table = "face_enrollments_unalterable_test";
+                const std::string database = queryScalarNoParam(
+                    dsn, "SELECT current_database()");
+
+                dropTable(dsn, table);
+                runCommand(dsn, "DROP ROLE IF EXISTS " + role);
+                runCommand(dsn, "CREATE ROLE " + role + " LOGIN PASSWORD '" +
+                                    password + "'");
+
+                // A table of the shape the store used to create: no name,
+                // no picture and no metadata. It belongs to the test
+                // user, so the limited role may not alter it.
+                runCommand(dsn,
+                           "CREATE TABLE \"" + table + "\" ("
+                           "id bigserial PRIMARY KEY, "
+                           "person_id integer NOT NULL, "
+                           "embedding real[] NOT NULL, "
+                           "enrolled_at timestamptz NOT NULL DEFAULT now())");
+                runCommand(dsn, "GRANT USAGE ON SCHEMA public TO " + role);
+                runCommand(dsn, "GRANT SELECT, INSERT, UPDATE, DELETE ON \"" +
+                                    table + "\" TO " + role);
+                runCommand(dsn, "GRANT USAGE, SELECT ON SEQUENCE \"" + table +
+                                    "_id_seq\" TO " + role);
+
+                const std::string limited =
+                    dsnForUser(dsn, role, password, database);
+
+                PostgresFaceStore pg;
+                PostgresFaceStore::Options options;
+                options.table = table;
+                pg.setOptions(options);
+
+                std::string error;
+
+                // The table cannot be altered, so the columns cannot be
+                // added -- but the store still opens and is used as the
+                // table is.
+                check(pg.open(limited, error),
+                      ("the store opens on a table it may not alter: " +
+                       error).c_str());
+                check(pg.isOpen(),
+                      "the store on an unalterable table is open");
+
+                const std::vector<std::string> missing =
+                    pg.missingPropertyColumns();
+                check(missing.size() == 3,
+                      "the three properties are reported as missing");
+                bool has_name = false;
+                for (const std::string& column : missing) {
+                    has_name = has_name || (column == "user_name");
+                }
+                check(has_name, "the missing name column is reported");
+
+                // A sample is stored, without the properties.
+                FaceEntry entry;
+                entry.person_id = 51;
+                entry.embedding = makeEmbeddingOnAxis(0);
+                entry.info.user_name = "Alan Turing";
+                check(pg.add(entry, error),
+                      ("the unalterable table accepts a sample: " + error)
+                          .c_str());
+
+                std::vector<FaceEntry> loaded;
+                check(pg.load(loaded, error),
+                      ("the unalterable table loads: " + error).c_str());
+                check(loaded.size() == 1, "the sample is in the table");
+                if (!loaded.empty()) {
+                    check(loaded[0].person_id == 51,
+                          "the sample kept its person id");
+                    check(loaded[0].info.user_name.empty(),
+                          "the name of the person was not stored");
+                }
+
+                // Preparing the schema on purpose still reports the
+                // problem, so that a deployment finds out.
+                check(!pg.prepareSchema(error),
+                      "preparing the schema reports the problem");
+                check(!error.empty(),
+                      "the problem of the schema comes with a reason");
+
+                pg.close();
+                dropTable(dsn, table);
+                runCommand(dsn, "DROP ROLE IF EXISTS " + role);
+            }
+        }
+    }
+#endif
 
     // ---- PostgreSQL store: table names at the identifier limit --------
     // PostgreSQL truncates identifiers to 63 bytes. A table name at that

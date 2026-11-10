@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -8,20 +9,45 @@
 
 namespace fd {
 
-/// One enrolled face sample: a person id and the embedding computed for it.
+/// The properties of a person that are not part of the embedding.
 ///
-/// Only the embedding is kept -- never the photograph it was computed from --
-/// so a face store stays small and does not duplicate biometric source
-/// material.
+/// They are stored next to every sample of that person, so that a store
+/// can answer "who is this?" without a second lookup.
+struct EnrolmentInfo {
+    /// The name of the person. It is what an application shows on screen
+    /// when the person is detected. May be empty.
+    std::string user_name;
+
+    /// A picture of the face, as the bytes of an encoded image (a JPEG,
+    /// for instance). It is optional: a sample without one still matches
+    /// perfectly well, the picture is only there for a human to look at.
+    std::vector<std::uint8_t> photo;
+
+    /// Arbitrary properties of the person, as a JSON document. May be
+    /// empty, which means "no metadata".
+    std::string metadata;
+};
+
+/// One enrolled face sample: a person id, the embedding computed for it
+/// and the properties of the person it belongs to.
+///
+/// The embedding is what the matching runs on. The properties -- the name
+/// of the person, a picture of the face and a JSON document with whatever
+/// the application wants to remember -- travel with the sample, so that a
+/// store hands them back together with the embedding.
 struct FaceEntry {
     int person_id = -1;
     Embedding embedding;
+    EnrolmentInfo info;
 };
 
 /// An enrolled person and how many samples of that person are stored.
 struct PersonSummary {
     int person_id = -1;
     int samples = 0;
+
+    /// The name of the person, when the store knows one.
+    std::string user_name;
 };
 
 /// A place where enrolled faces are kept.
@@ -69,12 +95,39 @@ public:
 
     /// Lists the enrolled people and how many samples each of them has.
     virtual bool list(std::vector<PersonSummary>& people, std::string& error);
+
+    /// The properties of a person that this store cannot keep.
+    ///
+    /// The names of the missing ones are returned: "user_name", "photo"
+    /// and "metadata". A store that keeps everything -- the file store --
+    /// returns an empty list.
+    ///
+    /// A PostgreSQL table that predates the properties and that the
+    /// runtime user is not allowed to alter is used as it is, so the
+    /// properties are dropped on the way in. An application can ask for
+    /// the missing ones and tell the user about it.
+    [[nodiscard]] virtual std::vector<std::string>
+    missingPropertyColumns() const;
+
+    /// Prepares the storage behind the store.
+    ///
+    /// The PostgreSQL store creates its table and adds the columns that
+    /// were introduced later to a table that is already there; the file
+    /// store has nothing to prepare. Returns false and explains itself
+    /// when the storage could not be prepared.
+    virtual bool prepareSchema(std::string& error);
 };
 
 /// A store backed by the flat binary file format.
 ///
 /// The on-disk layout is deliberately trivial:
-///   magic "FDB1" | uint32 count | { int32 person_id, float[128] } * count
+///   magic "FDB2" | uint32 count | entry * count
+///   entry := int32 person_id | float[128] | uint32 name_len | name bytes
+///          | uint32 photo_len | photo bytes | uint32 meta_len | meta bytes
+///
+/// The older "FDB1" format -- the person id and the embedding, nothing
+/// else -- is still read, so a database written by an earlier version
+/// keeps working. It is never written any more.
 class FileFaceStore : public FaceStore {
 public:
     bool open(const std::string& path, std::string& error) override;

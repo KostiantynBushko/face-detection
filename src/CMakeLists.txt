@@ -6,6 +6,7 @@ add_library(face_detection
     face/database.cpp
     face/store.cpp
     face/postgres_store.cpp
+    face/json.cpp
 )
 
 add_library(face-detection::face_detection ALIAS face_detection)

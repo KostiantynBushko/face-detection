@@ -7,26 +7,36 @@
 namespace fd {
 
 bool FaceDatabase::enroll(int person_id, const Image& image, const FaceBox& box,
-                          const FaceRecognizer& recognizer, Entry* out) {
+                          const FaceRecognizer& recognizer,
+                          const EnrolmentInfo& info, Entry* out) {
     Embedding embedding;
     if (!recognizer.embed(image, box, embedding)) {
         return false;
     }
-    return enroll(person_id, embedding, out);
+    return enroll(person_id, embedding, info, out);
 }
 
 bool FaceDatabase::enroll(int person_id, const Embedding& embedding,
-                          Entry* out) {
+                          const EnrolmentInfo& info, Entry* out) {
     if (!embedding.valid) {
         return false;
     }
     Entry entry;
     entry.person_id = person_id;
     entry.embedding = embedding;
+    entry.info = info;
     entries_.push_back(entry);
     if (out != nullptr) {
         *out = std::move(entry);
     }
+    return true;
+}
+
+bool FaceDatabase::add(const FaceEntry& entry) {
+    if (!entry.embedding.valid) {
+        return false;
+    }
+    entries_.push_back(entry);
     return true;
 }
 
@@ -41,18 +51,23 @@ FaceDatabase::Match FaceDatabase::match(const Embedding& embedding,
 
     float best_distance = std::numeric_limits<float>::max();
     int best_id = -1;
+    std::string best_name;
 
     for (const Entry& entry : entries_) {
         const float distance = embedding.cosineDistance(entry.embedding);
         if (distance < best_distance) {
             best_distance = distance;
             best_id = entry.person_id;
+            // The name travels with the sample, so the caller can put it
+            // on the screen without a second lookup.
+            best_name = entry.info.user_name;
         }
     }
 
     best.person_id = best_id;
     best.distance = best_distance;
     best.matched = best_id >= 0 && best_distance <= limit;
+    best.user_name = best_name;
     return best;
 }
 

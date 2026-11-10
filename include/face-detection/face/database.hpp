@@ -13,8 +13,10 @@ namespace fd {
 
 /// A registry of known faces, keyed by an application-defined person id.
 ///
-/// The database stores embeddings only — never photographs — so it stays
-/// small and does not duplicate biometric source material.
+/// The database holds the embeddings the matching runs on, together with
+/// the properties of the person each sample belongs to -- a name, a
+/// picture and a JSON document. The picture is optional, so a database
+/// that does not need one does not have to store any.
 ///
 /// The database itself is in-memory: it holds the samples that the matching
 /// runs against. Where those samples are *kept* is a separate concern,
@@ -31,6 +33,10 @@ public:
 
         /// True when a match was found within the accepted threshold.
         bool matched = false;
+
+        /// The name of the matched person, when the sample carries one.
+        /// It is what an application shows on screen.
+        std::string user_name;
     };
 
     /// An enrolled face.
@@ -46,14 +52,25 @@ public:
     /// @p box must come from a FaceDetector run on the same @p image.
     /// Returns false if the embedding could not be computed.
     ///
+    /// @p info carries the properties of the person -- the name, the
+    /// picture and the metadata. They are stored with the sample.
+    ///
     /// When @p out is given, it receives the stored entry, so that the
     /// caller can persist exactly what was added.
     bool enroll(int person_id, const Image& image, const FaceBox& box,
-                const FaceRecognizer& recognizer, Entry* out = nullptr);
+                const FaceRecognizer& recognizer,
+                const EnrolmentInfo& info = {}, Entry* out = nullptr);
 
     /// Adds an already-computed embedding.
     bool enroll(int person_id, const Embedding& embedding,
-                Entry* out = nullptr);
+                const EnrolmentInfo& info = {}, Entry* out = nullptr);
+
+    /// Adds a sample that was read from a store.
+    ///
+    /// The entry keeps its embedding and its properties, so a name that
+    /// was stored with the sample is still there after a reload.
+    /// Returns false when the entry holds an invalid embedding.
+    bool add(const FaceEntry& entry);
 
     /// Finds the closest entry for @p embedding.
     ///
@@ -90,8 +107,10 @@ public:
     /// Persists the database to @p path.
     ///
     /// The on-disk format is deliberately trivial:
-    ///   magic "FDB1" | uint32 count | { int32 person_id, float[128] } * count
-    /// Only embeddings are stored, never photographs.
+    ///   magic "FDB2" | uint32 count | entry * count
+    ///   entry := int32 person_id | float[128] | uint32 name_len | name bytes
+    ///          | uint32 photo_len | photo bytes | uint32 meta_len | meta bytes
+    /// The older "FDB1" format is still read.
     ///
     /// Returns false if the file could not be written.
     bool save(const std::string& path) const;
