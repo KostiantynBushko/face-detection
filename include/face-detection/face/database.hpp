@@ -6,6 +6,7 @@
 
 #include "face-detection/face/detector.hpp"
 #include "face-detection/face/recognizer.hpp"
+#include "face-detection/face/store.hpp"
 #include "face-detection/image.hpp"
 
 namespace fd {
@@ -14,6 +15,10 @@ namespace fd {
 ///
 /// The database stores embeddings only — never photographs — so it stays
 /// small and does not duplicate biometric source material.
+///
+/// The database itself is in-memory: it holds the samples that the matching
+/// runs against. Where those samples are *kept* is a separate concern,
+/// handled by a FaceStore (a file, a PostgreSQL table, ...).
 class FaceDatabase {
 public:
     /// The outcome of a lookup.
@@ -29,10 +34,7 @@ public:
     };
 
     /// An enrolled face.
-    struct Entry {
-        int person_id = -1;
-        Embedding embedding;
-    };
+    using Entry = FaceEntry;
 
     /// Typical distance thresholds for SFace cosine distance:
     /// ~0.4 is a reasonable "same person" cut-off; below ~0.3 is a very
@@ -43,11 +45,15 @@ public:
     ///
     /// @p box must come from a FaceDetector run on the same @p image.
     /// Returns false if the embedding could not be computed.
+    ///
+    /// When @p out is given, it receives the stored entry, so that the
+    /// caller can persist exactly what was added.
     bool enroll(int person_id, const Image& image, const FaceBox& box,
-                const FaceRecognizer& recognizer);
+                const FaceRecognizer& recognizer, Entry* out = nullptr);
 
     /// Adds an already-computed embedding.
-    bool enroll(int person_id, const Embedding& embedding);
+    bool enroll(int person_id, const Embedding& embedding,
+                Entry* out = nullptr);
 
     /// Finds the closest entry for @p embedding.
     ///
@@ -68,6 +74,18 @@ public:
 
     /// All enrolled entries, in insertion order.
     [[nodiscard]] const std::vector<Entry>& entries() const { return entries_; }
+
+    /// Writes the database to @p store.
+    ///
+    /// The store is expected to be open. Returns false if the store could
+    /// not be written.
+    bool save(FaceStore& store) const;
+
+    /// Reads the samples held by @p store and appends them to the database.
+    ///
+    /// The store is expected to be open. Returns false if the store could
+    /// not be read; the database is left untouched in that case.
+    bool load(FaceStore& store);
 
     /// Persists the database to @p path.
     ///

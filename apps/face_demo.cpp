@@ -4,14 +4,22 @@
 //   face-detection-app --image=photo.jpg
 //   face-detection-app --image=photo.jpg --enroll=42
 //   face-detection-app --image=photo.jpg --recognize
+//
+// The face database is either a file or a PostgreSQL table; the target is
+// picked by the --db option.
+//
+//   face-detection-app --db=faces.db --db-list
+//   face-detection-app --db=postgres://user@host/db --db-list
 
 #include "face-detection/face/database.hpp"
 #include "face-detection/face/detector.hpp"
 #include "face-detection/face/recognizer.hpp"
+#include "face-detection/face/store.hpp"
 #include "face-detection/image.hpp"
 
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -23,12 +31,13 @@ namespace {
 
 // Options that are switches: they never take a value.
 bool isBooleanOption(const std::string& name) {
-    return name == "recognize" || name == "help";
+    return name == "recognize" || name == "db-list" || name == "help";
 }
 
 bool isKnownOption(const std::string& name) {
     static const char* const kOptions[] = {
-        "image", "models", "threshold", "db", "enroll", "recognize", "help",
+        "image", "models", "threshold", "db", "enroll", "recognize",
+        "db-list", "db-remove", "help",
     };
     for (const char* known : kOptions) {
         if (name == known) {
@@ -68,15 +77,24 @@ void printHelp() {
            "\n"
            "Usage:\n"
            "  face-detection-app --image=<path> [options]\n"
+           "  face-detection-app --db=<target> --db-list\n"
            "\n"
            "Options:\n"
-           "  --image=<path>       Input image file (required).\n"
+           "  --image=<path>       Input image file (required unless only the\n"
+           "                       database is touched).\n"
            "  --models=<dir>       Directory holding the ONNX models\n"
            "                       (default: ./models or $FACE_DETECTION_MODELS).\n"
            "  --threshold=<f>      Minimum detection confidence, 0..1\n"
            "                       (default: 0.6).\n"
-           "  --db=<path>          Face database file. Loaded if it exists and\n"
-           "                       written back when --enroll is used.\n"
+           "  --db=<target>        Face database. A file path, or a\n"
+           "                       PostgreSQL connection string starting with\n"
+           "                       postgres:// or postgresql://.\n"
+           "                       Loaded if it exists and written back when\n"
+           "                       --enroll is used.\n"
+           "  --db-list            List the enrolled people and exit.\n"
+           "                       Needs --db.\n"
+           "  --db-remove=<id>     Remove every sample of a person and exit.\n"
+           "                       Needs --db.\n"
            "  --enroll=<id>        Enrol the first detected face under this\n"
            "                       person id instead of just reporting it.\n"
            "  --recognize          Compare detected faces against the enrolled\n"
@@ -105,7 +123,7 @@ bool validateArgs(int argc, char** argv) {
         const std::string name =
             (eq == std::string::npos) ? a.substr(2) : a.substr(2, eq - 2);
         if (!isKnownOption(name)) {
-            std::cerr << "Unknown option '" << a << "'.\n";
+            std::cerr << "Unknown option '" << a << "'\n";
             ok = false;
         } else if (eq != std::string::npos && isBooleanOption(name)) {
             std::cerr << "Option '--" << name << "' is a switch and takes no value.\n";
@@ -113,6 +131,39 @@ bool validateArgs(int argc, char** argv) {
         }
     }
     return ok;
+}
+
+// Opens the face database and prints what it holds.
+//
+// Returns false when the database could not be opened, so the caller can
+// stop before doing any work.
+bool openDatabase(const std::string& target, std::unique_ptr<fd::FaceStore>& store,
+                  fd::FaceDatabase& db) {
+    std::string error;
+    store = fd::makeFaceStore(target, error);
+    if (!store) {
+        std::cerr << error << '\n';
+        return false;
+    }
+    if (!store->open(target, error)) {
+        std::cerr << "Could not open the face database '" << target
+                  << "': " << error << '\n';
+        return false;
+    }
+
+    std::vector<fd::FaceEntry> entries;
+    if (!store->load(entries, error)) {
+        std::cout << "No enrolments in '" << target << "' yet (" << error
+                  << ").\n";
+        return true;
+    }
+
+    for (const fd::FaceEntry& entry : entries) {
+        db.enroll(entry.person_id, entry.embedding);
+    }
+    std::cout << "Loaded " << entries.size() << " enrolment(s) from " << target
+              << '\n';
+    return true;
 }
 
 } // namespace
@@ -128,6 +179,63 @@ int main(int argc, char** argv) {
     }
 
     const std::string image_path = arg(argc, argv, "image", "");
+    const std::string db_target = arg(argc, argv, "db", "");
+    const std::string enroll_str = arg(argc, argv, "enroll", "");
+    const std::string remove_str = arg(argc, argv, "db-remove", "");
+    const bool list_only = flag(argc, argv, "db-list");
+    const bool do_recognize = flag(argc, argv, "recognize");
+
+    // ---- Database-only operations -----------------------------------------
+    // Listing and removing people do not need an image, so they are handled
+    // before the detector is set up.
+    if (list_only || !remove_str.empty()) {
+        if (db_target.empty()) {
+            std::cerr << "--db-list and --db-remove need --db=<target>.\n";
+            return 2;
+        }
+
+        std::unique_ptr<fd::FaceStore> store;
+        fd::FaceDatabase db;
+        if (!openDatabase(db_target, store, db)) {
+            return 1;
+        }
+
+        std::string error;
+        if (list_only) {
+            std::vector<fd::PersonSummary> people;
+            if (!store->list(people, error)) {
+                std::cerr << "Could not list the face database: " << error
+                          << '\n';
+                return 1;
+            }
+            if (people.empty()) {
+                std::cout << "Nobody is enrolled in " << db_target << ".\n";
+            }
+            for (const fd::PersonSummary& person : people) {
+                std::cout << "  person " << person.person_id << ": "
+                          << person.samples << " sample(s)\n";
+            }
+            return 0;
+        }
+
+        int person_id = 0;
+        try {
+            person_id = std::stoi(remove_str);
+        } catch (const std::exception&) {
+            std::cerr << "Invalid --db-remove value '" << remove_str << "'\n";
+            return 2;
+        }
+        const int removed = store->remove(person_id, error);
+        if (removed < 0) {
+            std::cerr << "Could not remove person " << person_id << ": "
+                      << error << '\n';
+            return 1;
+        }
+        std::cout << "Removed " << removed << " sample(s) of person "
+                  << person_id << ".\n";
+        return 0;
+    }
+
     if (image_path.empty()) {
         std::cerr << "Missing required option --image=<path>.\n";
         return 2;
@@ -198,16 +306,12 @@ int main(int argc, char** argv) {
                   << '\n';
     }
 
-    const std::string db_path = arg(argc, argv, "db", "");
-    const std::string enroll_str = arg(argc, argv, "enroll", "");
-    const bool do_recognize = flag(argc, argv, "recognize");
-
-    // A database may be loaded even without --enroll/--recognize, so that
+    // The database may be loaded even without --enroll/--recognize, so that
     // its contents can be inspected.
+    std::unique_ptr<fd::FaceStore> store;
     fd::FaceDatabase db;
-    if (!db_path.empty() && db.load(db_path)) {
-        std::cout << "Loaded " << db.size() << " enrolment(s) from " << db_path
-                  << '\n';
+    if (!db_target.empty() && !openDatabase(db_target, store, db)) {
+        return 1;
     }
 
     if (!enroll_str.empty() || do_recognize) {
@@ -242,12 +346,25 @@ int main(int argc, char** argv) {
                 std::cerr << "Could not compute an embedding for the face.\n";
                 return 1;
             }
-            db.enroll(person_id, embedding);
+
+            fd::FaceEntry entry;
+            if (!db.enroll(person_id, embedding, &entry)) {
+                std::cerr << "Could not compute an embedding for the face.\n";
+                return 1;
+            }
             std::cout << "Enrolled the first face under person id " << person_id
                       << " (database now holds " << db.size() << ").\n";
-            if (!db_path.empty() && !db.save(db_path)) {
-                std::cerr << "Could not write the database to " << db_path << '\n';
-                return 1;
+
+            // The store appends the new sample on its own, so enrolling one
+            // person never rewrites the samples of the others.
+            if (store) {
+                std::string error;
+                if (!store->add(entry, error)) {
+                    std::cerr << "Could not write the enrolment to "
+                              << db_target << ": " << error << '\n';
+                    return 1;
+                }
+                std::cout << "Stored the enrolment in " << db_target << ".\n";
             }
             return 0;
         }
@@ -278,6 +395,9 @@ int main(int argc, char** argv) {
     return faces.empty() ? 1 : 0;
 #else
     (void)threshold;
+    (void)enroll_str;
+    (void)do_recognize;
+    (void)db_target;
     std::cerr << "This build has no OpenCV face stack; rebuild with OpenCV "
                  "(objdetect + dnn) available.\n";
     return 1;

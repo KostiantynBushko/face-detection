@@ -17,6 +17,7 @@ option(FACE_DETECTION_ENABLE_OPENCV "Enable the OpenCV-backed face stack" ON)
 option(FACE_DETECTION_BUILD_APPS    "Build the example application"       ${PROJECT_IS_TOP_LEVEL})
 option(FACE_DETECTION_BUILD_TESTS   "Build unit tests"                     ${PROJECT_IS_TOP_LEVEL})
 option(FACE_DETECTION_ENABLE_LEGACY "Enable the contrib 'face' module (LBPH fallback)" OFF)
+option(FACE_DETECTION_ENABLE_POSTGRESQL "Store enrolled faces in PostgreSQL" ON)
 option(FACE_DETECTION_ENABLE_SANITIZERS "Build with Address/Undefined sanitizers (debug)" OFF)
 
 # ---------------------------------------------------------------------------

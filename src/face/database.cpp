@@ -1,38 +1,32 @@
 #include "face-detection/face/database.hpp"
 
 #include <algorithm>
-#include <cstdint>
-#include <fstream>
 #include <limits>
 #include <utility>
 
 namespace fd {
 
-namespace {
-
-// The on-disk format is deliberately trivial:
-//   magic "FDB1" | uint32 count | { int32 person_id, float[128] } * count
-constexpr char kDbMagic[4] = {'F', 'D', 'B', '1'};
-
-} // namespace
-
 bool FaceDatabase::enroll(int person_id, const Image& image, const FaceBox& box,
-                          const FaceRecognizer& recognizer) {
+                          const FaceRecognizer& recognizer, Entry* out) {
     Embedding embedding;
     if (!recognizer.embed(image, box, embedding)) {
         return false;
     }
-    return enroll(person_id, embedding);
+    return enroll(person_id, embedding, out);
 }
 
-bool FaceDatabase::enroll(int person_id, const Embedding& embedding) {
+bool FaceDatabase::enroll(int person_id, const Embedding& embedding,
+                          Entry* out) {
     if (!embedding.valid) {
         return false;
     }
     Entry entry;
     entry.person_id = person_id;
     entry.embedding = embedding;
-    entries_.push_back(std::move(entry));
+    entries_.push_back(entry);
+    if (out != nullptr) {
+        *out = std::move(entry);
+    }
     return true;
 }
 
@@ -77,58 +71,43 @@ void FaceDatabase::clear() {
     entries_.clear();
 }
 
-bool FaceDatabase::save(const std::string& path) const {
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    if (!out) {
+bool FaceDatabase::save(FaceStore& store) const {
+    std::string error;
+    if (!store.save(entries_, error)) {
+        return false;
+    }
+    return true;
+}
+
+bool FaceDatabase::load(FaceStore& store) {
+    std::vector<Entry> loaded;
+    std::string error;
+    if (!store.load(loaded, error)) {
         return false;
     }
 
-    out.write(kDbMagic, sizeof(kDbMagic));
-    const auto count = static_cast<std::uint32_t>(entries_.size());
-    out.write(reinterpret_cast<const char*>(&count), sizeof(count));
-    for (const Entry& entry : entries_) {
-        const auto person_id = static_cast<std::int32_t>(entry.person_id);
-        out.write(reinterpret_cast<const char*>(&person_id), sizeof(person_id));
-        out.write(reinterpret_cast<const char*>(entry.embedding.values.data()),
-                  static_cast<std::streamsize>(sizeof(float) *
-                                               Embedding::kDimension));
+    for (const Entry& entry : loaded) {
+        entries_.push_back(entry);
     }
-    return out.good();
+    return true;
+}
+
+bool FaceDatabase::save(const std::string& path) const {
+    FileFaceStore store;
+    std::string error;
+    if (!store.open(path, error)) {
+        return false;
+    }
+    return save(store);
 }
 
 bool FaceDatabase::load(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
+    FileFaceStore store;
+    std::string error;
+    if (!store.open(path, error)) {
         return false;
     }
-
-    char magic[sizeof(kDbMagic)] = {};
-    in.read(magic, sizeof(magic));
-    if (!in ||
-        std::string(magic, sizeof(magic)) != std::string(kDbMagic, sizeof(kDbMagic))) {
-        return false;
-    }
-
-    std::uint32_t count = 0;
-    in.read(reinterpret_cast<char*>(&count), sizeof(count));
-    if (!in) {
-        return false;
-    }
-
-    for (std::uint32_t i = 0; i < count; ++i) {
-        std::int32_t person_id = 0;
-        in.read(reinterpret_cast<char*>(&person_id), sizeof(person_id));
-        Embedding embedding;
-        in.read(reinterpret_cast<char*>(embedding.values.data()),
-                static_cast<std::streamsize>(sizeof(float) *
-                                             Embedding::kDimension));
-        if (!in) {
-            return false;
-        }
-        embedding.valid = true;
-        enroll(person_id, embedding);
-    }
-    return true;
+    return load(store);
 }
 
 } // namespace fd

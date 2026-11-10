@@ -104,6 +104,44 @@ if(FACE_DETECTION_ENABLE_LEGACY)
 endif()
 
 # ---------------------------------------------------------------------------
+# Step 3: PostgreSQL (libpq) -- optional backend for the enrolled faces.
+#
+# The face store keeps the enrolled embeddings either in a flat file or in
+# a PostgreSQL table. The database backend needs libpq, the C client
+# library that ships with PostgreSQL; libpqxx is deliberately not used, so
+# the only extra build dependency is the one PostgreSQL already provides.
+# ---------------------------------------------------------------------------
+set(FD_HAVE_POSTGRES FALSE)
+set(FD_POSTGRES_TARGETS "")
+
+if(FACE_DETECTION_ENABLE_POSTGRESQL)
+    find_package(PostgreSQL QUIET)
+
+    if(PostgreSQL_FOUND)
+        set(FD_HAVE_POSTGRES TRUE)
+        set(FD_POSTGRES_TARGETS PostgreSQL::PostgreSQL)
+        message(STATUS "PostgreSQL ${PostgreSQL_VERSION} found (libpq)")
+    else()
+        find_package(PkgConfig QUIET)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(PostgreSQL IMPORTED_TARGET QUIET libpq)
+            if(PostgreSQL_FOUND)
+                set(FD_HAVE_POSTGRES TRUE)
+                set(FD_POSTGRES_TARGETS PkgConfig::PostgreSQL)
+                message(STATUS "PostgreSQL found via pkg-config (libpq)")
+            endif()
+        endif()
+    endif()
+
+    if(NOT FD_HAVE_POSTGRES)
+        message(WARNING
+            "PostgreSQL client library (libpq) not found; the PostgreSQL "
+            "face store is disabled. Install e.g. "
+            "'sudo apt install libpq-dev'.")
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # Sanitizers (debug builds only).
 # ---------------------------------------------------------------------------
 if(FACE_DETECTION_ENABLE_SANITIZERS)

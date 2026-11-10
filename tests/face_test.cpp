@@ -5,15 +5,22 @@
 
 #include "face-detection/face/database.hpp"
 #include "face-detection/face/detector.hpp"
+#include "face-detection/face/postgres_store.hpp"
 #include "face-detection/face/recognizer.hpp"
+#include "face-detection/face/store.hpp"
 #include "face-detection/image.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <vector>
+
+#ifdef FD_HAVE_POSTGRES
+#include <libpq-fe.h>
+#endif
 
 #ifndef FD_MODELS_DIR
 #define FD_MODELS_DIR "models"
@@ -56,6 +63,70 @@ fd::Embedding makeEmbeddingOnAxis(std::size_t axis) {
     e.valid = true;
     return e;
 }
+
+#ifdef FD_HAVE_POSTGRES
+
+/// Runs @p sql with @p param bound to $1 and returns the first column of
+/// the first row as a string. Returns an empty string when the query
+/// fails.
+std::string queryScalar(const std::string& dsn, const std::string& sql,
+                        const std::string& param) {
+    PGconn* conn = PQconnectdb(dsn.c_str());
+    if (conn == nullptr) {
+        return {};
+    }
+    const char* values[1] = {param.c_str()};
+    PGresult* result = PQexecParams(conn, sql.c_str(), 1, nullptr, values,
+                                     nullptr, nullptr, 0);
+    std::string value;
+    if (result != nullptr && PQresultStatus(result) == PGRES_TUPLES_OK &&
+        PQntuples(result) > 0 && !PQgetisnull(result, 0, 0)) {
+        value = PQgetvalue(result, 0, 0);
+    }
+    if (result != nullptr) {
+        PQclear(result);
+    }
+    PQfinish(conn);
+    return value;
+}
+
+/// True when the table @p table has an index on its person_id column.
+bool hasPersonIdIndex(const std::string& dsn, const std::string& table) {
+    const std::string sql =
+        "SELECT EXISTS (SELECT 1 FROM pg_index i "
+        "JOIN pg_class c ON c.oid = i.indrelid "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "JOIN pg_attribute a ON a.attrelid = i.indrelid "
+        "AND a.attnum = i.indkey[0] "
+        "WHERE c.relname = $1 AND n.nspname = current_schema() "
+        "AND a.attname = 'person_id')";
+    return queryScalar(dsn, sql, table) == "t";
+}
+
+/// Runs a statement that has no parameters.
+bool runCommand(const std::string& dsn, const std::string& sql) {
+    PGconn* conn = PQconnectdb(dsn.c_str());
+    if (conn == nullptr) {
+        return false;
+    }
+    PGresult* result = PQexec(conn, sql.c_str());
+    const bool ok = result != nullptr &&
+                    PQresultStatus(result) == PGRES_COMMAND_OK;
+    if (result != nullptr) {
+        PQclear(result);
+    }
+    PQfinish(conn);
+    return ok;
+}
+
+/// Drops the table @p table, if it is there.
+void dropTable(const std::string& dsn, const std::string& table) {
+    // The names used here only hold letters, digits and underscores, so
+    // quoting them is enough to keep them apart from the SQL.
+    runCommand(dsn, "DROP TABLE IF EXISTS \"" + table + "\" CASCADE");
+}
+
+#endif // FD_HAVE_POSTGRES
 
 } // namespace
 
@@ -139,6 +210,211 @@ int main() {
         Embedding invalid;
         check(!db.enroll(1, invalid), "enroll rejects an invalid embedding");
     }
+
+    // ---- FaceStore --------------------------------------------------------
+    {
+        using fd::FaceEntry;
+        using fd::FileFaceStore;
+        using fd::PersonSummary;
+
+        // The target decides which backend is used.
+        check(fd::isPostgresTarget("postgres://host/db"),
+              "postgres:// is a PostgreSQL target");
+        check(fd::isPostgresTarget("postgresql://host/db"),
+              "postgresql:// is a PostgreSQL target");
+        check(!fd::isPostgresTarget("faces.db"),
+              "a file path is not a PostgreSQL target");
+        check(!fd::isPostgresTarget(""),
+              "an empty target is not a PostgreSQL target");
+
+        std::string error;
+        auto store = fd::makeFaceStore("faces.db", error);
+        check(static_cast<bool>(store), "a file target yields a store");
+        check(dynamic_cast<FileFaceStore*>(store.get()) != nullptr,
+              "a file target yields a file store");
+
+        auto pg = fd::makeFaceStore("postgres://host/db", error);
+        check(static_cast<bool>(pg) == fd::postgresAvailable(),
+              "a PostgreSQL target yields a store only when PostgreSQL is "
+              "available");
+
+        // ---- the file store round-trips the samples ----
+        const std::string path = "face_store_test.db";
+        std::remove(path.c_str());
+        {
+            FileFaceStore file_store;
+            check(file_store.open(path, error), "the file store opens");
+            check(file_store.isOpen(), "the file store reports open");
+
+            std::vector<FaceEntry> loaded;
+            check(!file_store.load(loaded, error),
+                  "loading a missing file fails");
+            check(loaded.empty(), "a failed load leaves nothing behind");
+
+            FaceEntry first;
+            first.person_id = 11;
+            first.embedding = makeEmbeddingOnAxis(0);
+            check(file_store.add(first, error), "the file store adds a sample");
+
+            FaceEntry second;
+            second.person_id = 12;
+            second.embedding = makeEmbeddingOnAxis(1);
+            check(file_store.add(second, error),
+                  "the file store adds a second sample");
+
+            std::vector<PersonSummary> people;
+            check(file_store.list(people, error),
+                  "the file store lists the enrolled people");
+            check(people.size() == 2, "two people are listed");
+            if (people.size() == 2) {
+                check(people[0].person_id == 11 && people[0].samples == 1,
+                      "the first person has one sample");
+                check(people[1].person_id == 12 && people[1].samples == 1,
+                      "the second person has one sample");
+            }
+
+            check(file_store.remove(11, error) == 1,
+                  "the file store removes one sample");
+            check(file_store.remove(11, error) == 0,
+                  "removing an unknown person removes nothing");
+
+            file_store.close();
+            check(!file_store.isOpen(), "the file store reports closed");
+        }
+
+        // The samples survived the round trip through the file.
+        {
+            FileFaceStore file_store;
+            check(file_store.open(path, error), "the file store reopens");
+            std::vector<FaceEntry> loaded;
+            check(file_store.load(loaded, error), "the file store loads");
+            check(loaded.size() == 1, "one sample is left in the file");
+            if (loaded.size() == 1) {
+                check(loaded[0].person_id == 12,
+                      "the remaining sample kept its person id");
+                check(loaded[0].embedding.valid,
+                      "the remaining sample kept its embedding");
+            }
+        }
+        std::remove(path.c_str());
+    }
+
+    // ---- PostgreSQL store --------------------------------------------------
+    // The database tests need a server, so they only run when one is named
+    // in the environment. Everything else stays database-free.
+    {
+        const char* dsn = std::getenv("FACE_DETECTION_TEST_DSN");
+        if (dsn == nullptr || *dsn == '\0') {
+            std::cout << "SKIP: PostgreSQL store test (set "
+                         "FACE_DETECTION_TEST_DSN to run it)\n";
+        } else if (!fd::postgresAvailable()) {
+            std::cout << "SKIP: PostgreSQL store test (this build has no "
+                         "PostgreSQL support)\n";
+        } else {
+            using fd::FaceEntry;
+            using fd::PersonSummary;
+            using fd::PostgresFaceStore;
+
+            std::string error;
+            PostgresFaceStore pg;
+            const bool opened = pg.open(dsn, error);
+            check(opened, ("the PostgreSQL store opens: " + error).c_str());
+            check(pg.isOpen(), "the PostgreSQL store reports open");
+
+            // Start from a known state.
+            pg.remove(9001, error);
+            pg.remove(9002, error);
+
+            FaceEntry first;
+            first.person_id = 9001;
+            first.embedding = makeEmbeddingOnAxis(0);
+            const bool added = pg.add(first, error);
+            check(added, "the PostgreSQL store adds a sample");
+
+            FaceEntry again;
+            again.person_id = 9001;
+            again.embedding = makeEmbeddingOnAxis(0);
+            const bool addedAgain = pg.add(again, error);
+            check(addedAgain,
+                  "the PostgreSQL store adds a second sample of the person");
+
+            std::vector<FaceEntry> loaded;
+            const bool loadedOk = pg.load(loaded, error);
+            check(loadedOk, ("the PostgreSQL store loads: " + error).c_str());
+
+            int found = 0;
+            bool exact = true;
+            for (const FaceEntry& entry : loaded) {
+                if (entry.person_id != 9001) {
+                    continue;
+                }
+                ++found;
+                for (std::size_t i = 0; i < Embedding::kDimension; ++i) {
+                    if (entry.embedding.values[i] != first.embedding.values[i]) {
+                        exact = false;
+                    }
+                }
+            }
+            check(found == 2, "both samples of the person come back");
+            check(exact, "the embedding survives the round trip unchanged");
+
+            std::vector<PersonSummary> people;
+            const bool listedOk = pg.list(people, error);
+            check(listedOk, "the PostgreSQL store lists");
+            bool listed = false;
+            for (const PersonSummary& person : people) {
+                if (person.person_id == 9001 && person.samples == 2) {
+                    listed = true;
+                }
+            }
+            check(listed, "the person is listed with both of its samples");
+
+            check(pg.remove(9001, error) == 2,
+                  "the PostgreSQL store removes both samples");
+            check(pg.remove(9001, error) == 0,
+                  "removing an unknown person removes nothing");
+
+            pg.close();
+            check(!pg.isOpen(), "the PostgreSQL store reports closed");
+        }
+    }
+
+    // ---- PostgreSQL store: table names at the identifier limit --------
+    // PostgreSQL truncates identifiers to 63 bytes. A table name at that
+    // limit used to make the name of the index collapse onto the name of
+    // the table, so the index was silently never created.
+#ifdef FD_HAVE_POSTGRES
+    {
+        const char* dsn = std::getenv("FACE_DETECTION_TEST_DSN");
+        if (dsn != nullptr && *dsn != '\0' && fd::postgresAvailable()) {
+            using fd::PostgresFaceStore;
+
+            // The longest name PostgreSQL accepts, and one that already
+            // ends in the suffix the index name is built from.
+            std::vector<std::string> tables;
+            tables.push_back(std::string(63, 'a'));
+            tables.push_back(std::string(49, 'b') + "_person_id_idx");
+
+            for (const std::string& table : tables) {
+                PostgresFaceStore named;
+                PostgresFaceStore::Options namedOptions;
+                namedOptions.table = table;
+                named.setOptions(namedOptions);
+
+                std::string error;
+                const bool opened = named.open(dsn, error);
+                check(opened,
+                      ("the store opens with a " +
+                       std::to_string(table.size()) +
+                       " character table name: " + error).c_str());
+                check(hasPersonIdIndex(dsn, table),
+                      "the person_id index is created for the table");
+
+                dropTable(dsn, table);
+            }
+        }
+    }
+#endif
 
     // ---- Model-backed checks ----------------------------------------------
     const std::string models_dir = FD_MODELS_DIR;

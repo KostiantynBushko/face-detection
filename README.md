@@ -28,6 +28,11 @@ Frame (BGR) ──► FaceDetector ──► FaceBox[] ──► FaceRecognizer 
   sudo apt install libopencv-dev     # Debian/Ubuntu
   ```
 - The ONNX model weights (see [Models](#models)).
+- Optional: the PostgreSQL client library (libpq), for the
+  [PostgreSQL face store](#where-the-enrolments-live).
+  ```sh
+  sudo apt install libpq-dev     # Debian/Ubuntu
+  ```
 
 ## Build
 
@@ -48,6 +53,7 @@ Binaries land in `build/<preset>/bin/`. The `asan` preset builds into
 | `FACE_DETECTION_BUILD_APPS`      | `ON`\*  | Build the example application             |
 | `FACE_DETECTION_BUILD_TESTS`     | `ON`\*  | Build the unit tests                     |
 | `FACE_DETECTION_ENABLE_LEGACY`   | `OFF`   | Enable the contrib `face` module (LBPH)  |
+| `FACE_DETECTION_ENABLE_POSTGRESQL` | `ON`  | Store the enrolments in PostgreSQL       |
 | `FACE_DETECTION_ENABLE_SANITIZERS` | `OFF` | ASan/UBSan in debug builds               |
 
 \* `ON` only when this is the top-level project; `OFF` when it is pulled in
@@ -113,6 +119,61 @@ database.save("faces.db");
 database.load("faces.db");
 ```
 
+### Where the enrolments live
+
+`FaceDatabase` itself is in-memory: it holds the samples that the matching
+runs against. *Where* those samples are kept is a separate concern, handled
+by a `FaceStore`:
+
+```cpp
+#include "face-detection/face/store.hpp"
+
+std::string error;
+auto store = fd::makeFaceStore("postgres://user@localhost/faces", error);
+if (!store) { /* the build has no PostgreSQL support */ }
+if (!store->open("postgres://user@localhost/faces", error)) { /* handle */ }
+
+std::vector<fd::FaceEntry> entries;
+store->load(entries, error);          // read every sample
+
+fd::FaceEntry entry;                  // append one sample
+entry.person_id = 42;
+entry.embedding = embedding;
+store->add(entry, error);             // cheap: one INSERT
+
+store->remove(/*person_id=*/42, error);
+```
+
+Two implementations ship with the library:
+
+| Store               | Target                                    | Notes                                        |
+|---------------------|-------------------------------------------|----------------------------------------------|
+| `FileFaceStore`     | a file path                               | The flat `FDB1` binary format                |
+| `PostgresFaceStore` | `postgres://…` / `postgresql://…`         | A PostgreSQL table; needs libpq              |
+
+`makeFaceStore()` picks the backend from the target: a target that starts
+with `postgres://` or `postgresql://` is a PostgreSQL one, everything else is
+a file.
+
+The PostgreSQL store keeps one row per sample:
+
+```sql
+CREATE TABLE face_enrollments (
+    id          bigserial   PRIMARY KEY,
+    person_id   integer     NOT NULL,
+    embedding   real[]      NOT NULL,
+    enrolled_at timestamptz NOT NULL DEFAULT now()
+);
+```
+
+The table is created when the store connects; [`sql/schema.sql`](sql/schema.sql)
+holds the same DDL for deployments that prepare the schema separately. The
+connection uses libpq, so `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER` and
+`PGPASSWORD` apply whenever the connection string does not spell them out.
+
+Only the embedding is stored — never the photograph it was computed from —
+so the table stays small and does not duplicate biometric source material.
+
 ### Key types
 
 | Type              | Notes                                                                    |
@@ -121,6 +182,8 @@ database.load("faces.db");
 | `fd::FaceBox`     | Bounding box, confidence in [0,1], and five landmarks.                   |
 | `fd::Embedding`   | 128-dimensional, L2-normalised feature vector.                          |
 | `fd::FaceDatabase`| Enrolled embeddings keyed by an application-defined person id. `save`/`load` persist them. |
+| `fd::FaceStore`    | Where the enrolled samples are kept — a file or a PostgreSQL table. |
+| `fd::FaceEntry`    | One enrolled sample: a person id and its embedding. |
 
 ### Distance semantics
 
@@ -137,6 +200,20 @@ Typical SFace thresholds:
 | `> 0.60` | different people        |
 
 Tune against your own camera, lens and lighting.
+
+## Tests
+
+```sh
+ctest --preset default
+```
+
+The suite runs without a database. The PostgreSQL tests are skipped unless a
+server is named in the environment:
+
+```sh
+FACE_DETECTION_TEST_DSN="host=127.0.0.1 dbname=faces user=faces" \
+    ctest --preset default
+```
 
 ## Design notes
 
@@ -191,6 +268,14 @@ stack in two independent steps.
 ./build/debug/bin/face-detection-app --image=photo.jpg
 ./build/debug/bin/face-detection-app --image=photo.jpg --db=faces.db --enroll=42
 ./build/debug/bin/face-detection-app --image=photo.jpg --db=faces.db --recognize
+
+# The same, but with the enrolments in PostgreSQL
+./build/debug/bin/face-detection-app --image=photo.jpg \
+    --db=postgres://user@localhost/faces --enroll=42
+
+# List and remove the enrolled people (no image needed)
+./build/debug/bin/face-detection-app --db=postgres://user@localhost/faces --db-list
+./build/debug/bin/face-detection-app --db=postgres://user@localhost/faces --db-remove=42
 ```
 
 | Option            | Default              | Meaning                                     |
@@ -198,7 +283,9 @@ stack in two independent steps.
 | `--image=<path>`  | *(required)*         | Input image                                 |
 | `--models=<dir>`  | `$FACE_DETECTION_MODELS` or `models` | Model directory       |
 | `--threshold=<f>` | `0.6`                | Minimum detection confidence               |
-| `--db=<path>`     | *(none)*             | Face database file (load + save)            |
+| `--db=<target>`   | *(none)*             | Face database: a file path or a `postgres://…` connection string (load + save) |
+| `--db-list`       | *(off)*              | List the enrolled people and exit           |
+| `--db-remove=<id>`| *(none)*             | Remove every sample of a person and exit    |
 | `--enroll=<id>`   | *(none)*             | Enrol the first detected face under this id |
 | `--recognize`     | *(off)*              | Match against the enrolled set             |
 | `-h`, `--help`    | —                    | Print the option list                       |
@@ -245,7 +332,10 @@ include/face-detection/image.hpp            Public image type
 include/face-detection/face/detector.hpp     Face detection
 include/face-detection/face/recognizer.hpp   Face embeddings
 include/face-detection/face/database.hpp     Enrolment / lookup
+include/face-detection/face/store.hpp        Where the enrolments are kept
+include/face-detection/face/postgres_store.hpp  PostgreSQL backend
 src/                                          Implementation
+sql/schema.sql                                DDL of the PostgreSQL table
 apps/face_demo.cpp                            Example CLI application
 tests/face_test.cpp                           Smoke tests (no external test deps)
 models/fetch.sh                               Model downloader with checksums
