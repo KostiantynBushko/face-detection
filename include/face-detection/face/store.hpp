@@ -89,6 +89,22 @@ public:
     /// it, so enrolling a person never rewrites the other people's samples.
     virtual bool add(const FaceEntry& entry, std::string& error);
 
+    /// Stores several samples at once.
+    ///
+    /// This is what an application needs when it enrols a person with
+    /// several views of the face: the samples of one person belong
+    /// together, so they are written in one go.
+    ///
+    /// The generic implementation loads the store, appends the samples and
+    /// saves it again, so the file is rewritten once and not once per
+    /// sample. PostgreSQL overrides it and writes the samples in a single
+    /// transaction, so that a person is either stored with all of its
+    /// samples or not at all.
+    ///
+    /// An empty list is a no-op and succeeds.
+    virtual bool addAll(const std::vector<FaceEntry>& entries,
+                        std::string& error);
+
     /// Removes every sample of @p person_id.
     /// Returns the number of removed samples, or -1 on error.
     virtual int remove(int person_id, std::string& error);
@@ -139,6 +155,11 @@ public:
 
     /// Appends a sample. A file that does not exist yet is created.
     bool add(const FaceEntry& entry, std::string& error) override;
+
+    /// Appends several samples. The file is rewritten once, not once per
+    /// sample. A file that does not exist yet is created.
+    bool addAll(const std::vector<FaceEntry>& entries,
+                std::string& error) override;
 
     /// Removes every sample of @p person_id.
     int remove(int person_id, std::string& error) override;

@@ -77,6 +77,12 @@ public:
     /// of the other people, so enrolling one person leaves the rest alone.
     bool add(const FaceEntry& entry, std::string& error) override;
 
+    /// Appends several samples in one transaction: the rows of one person
+    /// land together, and either all of them are stored or none of them
+    /// is. The rows of the other people are left alone.
+    bool addAll(const std::vector<FaceEntry>& entries,
+                std::string& error) override;
+
     int remove(int person_id, std::string& error) override;
     bool list(std::vector<PersonSummary>& people, std::string& error) override;
 

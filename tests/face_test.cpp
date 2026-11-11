@@ -602,6 +602,60 @@ int main() {
         std::remove(path.c_str());
     }
 
+    // ---- the file store writes several samples at once --------------------
+    {
+        using fd::FaceEntry;
+        using fd::FileFaceStore;
+        using fd::PersonSummary;
+
+        std::string error;
+        const std::string path = "face_store_batch_test.db";
+        std::remove(path.c_str());
+        {
+            FileFaceStore file_store;
+            check(file_store.open(path, error), "the file store opens");
+
+            // The samples of one person are written in one go: the file is
+            // rewritten once and not once per sample.
+            std::vector<FaceEntry> batch;
+            for (std::size_t view = 0; view < 3; ++view) {
+                FaceEntry entry;
+                entry.person_id = 5;
+                entry.embedding = makeEmbeddingOnAxis(view);
+                entry.info.metadata = "{\"auto_enrolled\": true}";
+                batch.push_back(entry);
+            }
+            check(file_store.addAll(batch, error),
+                  "the file store writes a batch of samples");
+
+            // A batch of nothing is a no-op, and it succeeds.
+            check(file_store.addAll({}, error),
+                  "the file store accepts an empty batch");
+        }
+        {
+            FileFaceStore file_store;
+            check(file_store.open(path, error), "the file store reopens");
+            std::vector<FaceEntry> loaded;
+            check(file_store.load(loaded, error), "the file store loads");
+            check(loaded.size() == 3, "the whole batch is in the file");
+            for (const FaceEntry& entry : loaded) {
+                check(entry.person_id == 5,
+                      "every sample of the batch kept its person id");
+                check(entry.embedding.valid,
+                      "every sample of the batch kept its embedding");
+            }
+
+            std::vector<PersonSummary> people;
+            check(file_store.list(people, error), "the file store lists");
+            check(people.size() == 1, "the batch is one person");
+            if (people.size() == 1) {
+                check(people[0].person_id == 5 && people[0].samples == 3,
+                      "the person has the three samples of the batch");
+            }
+        }
+        std::remove(path.c_str());
+    }
+
     // ---- the file store reads the format of an earlier version -------------
     {
         using fd::FaceEntry;
@@ -739,6 +793,89 @@ int main() {
             check(!pg.isOpen(), "the PostgreSQL store reports closed");
         }
     }
+
+    // ---- PostgreSQL store: a batch of samples ---------------------------
+#ifdef FD_HAVE_POSTGRES
+    {
+        const char* dsn = std::getenv("FACE_DETECTION_TEST_DSN");
+        if (dsn != nullptr && *dsn != '\0' && fd::postgresAvailable()) {
+            using fd::FaceEntry;
+            using fd::PersonSummary;
+            using fd::PostgresFaceStore;
+
+            std::string error;
+            PostgresFaceStore pg;
+            check(pg.open(dsn, error),
+                  ("the PostgreSQL store opens: " + error).c_str());
+            pg.remove(9004, error);
+
+            // The samples of one person are written in one go: they land
+            // in one transaction.
+            std::vector<FaceEntry> batch;
+            for (std::size_t view = 0; view < 3; ++view) {
+                FaceEntry entry;
+                entry.person_id = 9004;
+                entry.embedding = makeEmbeddingOnAxis(view);
+                entry.info.metadata = "{\"auto_enrolled\": true}";
+                batch.push_back(entry);
+            }
+            check(pg.addAll(batch, error),
+                  ("the PostgreSQL store writes a batch of samples: " + error)
+                      .c_str());
+
+            std::vector<FaceEntry> loaded;
+            check(pg.load(loaded, error),
+                  ("the PostgreSQL store loads: " + error).c_str());
+            int found = 0;
+            for (const FaceEntry& entry : loaded) {
+                if (entry.person_id == 9004) {
+                    ++found;
+                }
+            }
+            check(found == 3, "the whole batch is in the table");
+
+            std::vector<PersonSummary> people;
+            check(pg.list(people, error), "the PostgreSQL store lists");
+            bool listed = false;
+            for (const PersonSummary& person : people) {
+                if (person.person_id == 9004 && person.samples == 3) {
+                    listed = true;
+                }
+            }
+            check(listed, "the person is listed with the three samples of "
+                          "the batch");
+
+            // A batch that holds an invalid embedding is refused as a
+            // whole: the transaction is rolled back and nothing of the
+            // batch reaches the table.
+            pg.remove(9005, error);
+            std::vector<FaceEntry> broken;
+            FaceEntry good;
+            good.person_id = 9005;
+            good.embedding = makeEmbeddingOnAxis(0);
+            broken.push_back(good);
+            FaceEntry invalid;
+            invalid.person_id = 9005;
+            broken.push_back(invalid);
+            check(!pg.addAll(broken, error),
+                  "a batch with an invalid embedding is refused");
+
+            loaded.clear();
+            check(pg.load(loaded, error), "the PostgreSQL store loads");
+            found = 0;
+            for (const FaceEntry& entry : loaded) {
+                if (entry.person_id == 9005) {
+                    ++found;
+                }
+            }
+            check(found == 0, "nothing of the refused batch was written");
+
+            check(pg.remove(9004, error) == 3,
+                  "the PostgreSQL store removes the three samples");
+            pg.close();
+        }
+    }
+#endif
 
     // ---- PostgreSQL store: a table of an earlier version is migrated ----
 #ifdef FD_HAVE_POSTGRES

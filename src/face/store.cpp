@@ -93,6 +93,22 @@ bool FaceStore::add(const FaceEntry& entry, std::string& error) {
     return save(entries, error);
 }
 
+bool FaceStore::addAll(const std::vector<FaceEntry>& entries,
+                        std::string& error) {
+    if (entries.empty()) {
+        return true;
+    }
+    // The samples are appended to the ones that are already there, and the
+    // whole store is written once: a person that is enrolled with several
+    // views does not rewrite the file once per view.
+    std::vector<FaceEntry> all;
+    if (!load(all, error)) {
+        return false;
+    }
+    all.insert(all.end(), entries.begin(), entries.end());
+    return save(all, error);
+}
+
 int FaceStore::remove(int person_id, std::string& error) {
     std::vector<FaceEntry> entries;
     if (!load(entries, error)) {
@@ -257,6 +273,19 @@ bool FileFaceStore::add(const FaceEntry& entry, std::string& error) {
     // been enrolled yet.
     entries.push_back(entry);
     return save(entries, error);
+}
+
+bool FileFaceStore::addAll(const std::vector<FaceEntry>& entries,
+                            std::string& error) {
+    std::vector<FaceEntry> all;
+    const LoadResult result = readEntries(all, error);
+    if (result == LoadResult::Invalid) {
+        return false;
+    }
+    // A missing file is not a problem here: it just means that nobody has
+    // been enrolled yet.
+    all.insert(all.end(), entries.begin(), entries.end());
+    return save(all, error);
 }
 
 int FileFaceStore::remove(int person_id, std::string& error) {

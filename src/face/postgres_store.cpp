@@ -885,6 +885,52 @@ bool PostgresFaceStore::add(const FaceEntry& entry, std::string& error) {
                       params.formats.data(), params.lengths.data());
 }
 
+bool PostgresFaceStore::addAll(const std::vector<FaceEntry>& entries,
+                                std::string& error) {
+    if (!isOpen()) {
+        error = "the PostgreSQL store is not open";
+        return false;
+    }
+    if (entries.empty()) {
+        return true;
+    }
+
+    // The samples of one person land in one transaction: the person is
+    // either stored with all of its views or not at all.
+    if (!execCommand(impl_->conn, "BEGIN", error)) {
+        return false;
+    }
+
+    for (const FaceEntry& entry : entries) {
+        if (!entry.embedding.valid) {
+            error = "the database holds an invalid embedding";
+            std::string ignored;
+            execCommand(impl_->conn, "ROLLBACK", ignored);
+            return false;
+        }
+
+        InsertParams params;
+        std::string sql;
+        if (!buildInsert(impl_->table, impl_->has_user_name,
+                         impl_->has_photo, impl_->has_metadata, entry, params,
+                         sql, error)) {
+            std::string ignored;
+            execCommand(impl_->conn, "ROLLBACK", ignored);
+            return false;
+        }
+
+        if (!execParams(impl_->conn, sql, params.values.data(),
+                        static_cast<int>(params.values.size()), error,
+                        params.formats.data(), params.lengths.data())) {
+            std::string ignored;
+            execCommand(impl_->conn, "ROLLBACK", ignored);
+            return false;
+        }
+    }
+
+    return execCommand(impl_->conn, "COMMIT", error);
+}
+
 bool PostgresFaceStore::save(const std::vector<FaceEntry>& entries,
                              std::string& error) {
     if (!isOpen()) {
@@ -1084,6 +1130,12 @@ bool PostgresFaceStore::save(const std::vector<FaceEntry>&, std::string& error) 
 }
 
 bool PostgresFaceStore::add(const FaceEntry&, std::string& error) {
+    error = "this build has no PostgreSQL support";
+    return false;
+}
+
+bool PostgresFaceStore::addAll(const std::vector<FaceEntry>&,
+                                std::string& error) {
     error = "this build has no PostgreSQL support";
     return false;
 }
