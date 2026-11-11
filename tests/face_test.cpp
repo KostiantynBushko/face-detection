@@ -368,6 +368,36 @@ int main() {
               "the name of a reloaded sample comes back as well");
     }
 
+    // ---- the name of a person does not depend on the closest sample ----
+    // A person can have several samples, and only some of them carry the
+    // name. The name belongs to the person, so it has to come back even
+    // when the sample that is the closest one does not carry it.
+    {
+        using fd::EnrolmentInfo;
+        using fd::FaceEntry;
+
+        FaceDatabase db;
+
+        EnrolmentInfo named;
+        named.user_name = "Ada Lovelace";
+        check(db.enroll(42, makeEmbedding(1.0f), named),
+              "a named sample is enrolled");
+
+        // The same person, a second sample, without a name. It is the
+        // closer one of the two, so the match lands on it.
+        FaceEntry plain;
+        plain.person_id = 42;
+        plain.embedding = makeEmbedding(0.999f);
+        check(db.add(plain), "a second sample of the person is added");
+
+        const auto hit = db.match(makeEmbedding(0.9995f), 0.4f);
+        check(hit.matched, "the person is matched");
+        check(hit.person_id == 42, "the person id is reported");
+        check(hit.user_name == "Ada Lovelace",
+              "the name of the person comes back, even when the closest "
+              "sample does not carry it");
+    }
+
     // ---- the JSON validator -----------------------------------------------
     {
         static const char* const kValid[] = {

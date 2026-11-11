@@ -34,8 +34,12 @@ public:
         /// True when a match was found within the accepted threshold.
         bool matched = false;
 
-        /// The name of the matched person, when the sample carries one.
-        /// It is what an application shows on screen.
+        /// The name of the matched person, when one of its samples carries
+        /// one. It is what an application shows on screen.
+        ///
+        /// The name belongs to the person, so it is looked up among all of
+        /// its samples: the closest sample is not necessarily the one that
+        /// carries the name.
         std::string user_name;
     };
 

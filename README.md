@@ -118,6 +118,7 @@ database.enroll(/*person_id=*/42, image, faces.front(), recognizer, info);
 const fd::FaceDatabase::Match match = database.match(embedding);
 if (match.matched) {
     // match.person_id == 42
+    // match.user_name == "Ada Lovelace"
 }
 
 // Persist the enrolments. The file format is shared with
@@ -125,6 +126,12 @@ if (match.matched) {
 database.save("faces.db");
 database.load("faces.db");
 ```
+
+The name in a match belongs to the *person*, not to the sample that
+happened to be the closest one. It is looked up among all the samples of
+the matched person, so it comes back even when the closest sample does not
+carry it -- which is what happens when a person was enrolled automatically
+and named afterwards.
 
 ### Where the enrolments live
 

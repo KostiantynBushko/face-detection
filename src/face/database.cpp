@@ -51,16 +51,29 @@ FaceDatabase::Match FaceDatabase::match(const Embedding& embedding,
 
     float best_distance = std::numeric_limits<float>::max();
     int best_id = -1;
-    std::string best_name;
 
     for (const Entry& entry : entries_) {
         const float distance = embedding.cosineDistance(entry.embedding);
         if (distance < best_distance) {
             best_distance = distance;
             best_id = entry.person_id;
-            // The name travels with the sample, so the caller can put it
-            // on the screen without a second lookup.
-            best_name = entry.info.user_name;
+        }
+    }
+
+    // The name belongs to the *person*, not to the sample that happened to
+    // be the closest one: a person can have several samples, and only
+    // some of them carry the name. The name is therefore looked up among
+    // all the samples of the matched person, with the same rule the
+    // stores use when they list the people -- the largest name wins.
+    std::string best_name;
+    if (best_id >= 0) {
+        for (const Entry& entry : entries_) {
+            if (entry.person_id != best_id || entry.info.user_name.empty()) {
+                continue;
+            }
+            if (best_name.empty() || entry.info.user_name > best_name) {
+                best_name = entry.info.user_name;
+            }
         }
     }
 
