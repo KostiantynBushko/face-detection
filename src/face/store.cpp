@@ -84,6 +84,14 @@ bool writeBlob(std::ostream& out, const std::vector<std::uint8_t>& blob) {
 // FaceStore: the generic implementations
 // ---------------------------------------------------------------------------
 
+bool FaceStore::update(const std::vector<FaceEntry>& entries,
+                       std::string& error) {
+    // A backend that cannot update a row in place rewrites the whole
+    // store. The rows then get new ids and a new time of enrolment, which
+    // is what the file store does anyway.
+    return save(entries, error);
+}
+
 bool FaceStore::add(const FaceEntry& entry, std::string& error) {
     std::vector<FaceEntry> entries;
     if (!load(entries, error)) {

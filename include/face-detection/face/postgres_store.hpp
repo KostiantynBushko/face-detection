@@ -73,6 +73,14 @@ public:
     bool save(const std::vector<FaceEntry>& entries,
               std::string& error) override;
 
+    /// Changes the samples in place.
+    ///
+    /// A sample that carries the id of a row keeps that row: its identity
+    /// and the time the face was enrolled survive the change. The samples
+    /// are written in one transaction.
+    bool update(const std::vector<FaceEntry>& entries,
+                std::string& error) override;
+
     /// Appends a single sample. Unlike save() this never rewrites the rows
     /// of the other people, so enrolling one person leaves the rest alone.
     bool add(const FaceEntry& entry, std::string& error) override;

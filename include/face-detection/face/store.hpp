@@ -36,6 +36,15 @@ struct EnrolmentInfo {
 /// the application wants to remember -- travel with the sample, so that a
 /// store hands them back together with the embedding.
 struct FaceEntry {
+    /// The id of the row that holds this sample, when the store gives the
+    /// rows an id (PostgreSQL does).
+    ///
+    /// It is filled in by load() and is 0 for a sample that was not read
+    /// from a store. A store that keeps the id can update a sample in
+    /// place, so that the identity of the row and the time the face was
+    /// enrolled survive a change of the sample.
+    long row_id = 0;
+
     int person_id = -1;
     Embedding embedding;
     EnrolmentInfo info;
@@ -81,6 +90,20 @@ public:
     /// Replaces the whole content of the store with @p entries.
     virtual bool save(const std::vector<FaceEntry>& entries,
                       std::string& error) = 0;
+
+    /// Updates the samples of the store.
+    ///
+    /// The entries are the ones the store holds -- the ones load() returned
+    /// -- with the changes that are to be written. A sample that carries
+    /// the id of a row is updated in place, so that the row keeps its
+    /// identity and the time the face was enrolled. A sample without an id
+    /// is stored as a new one.
+    ///
+    /// The default implementation rewrites the whole store, which gives
+    /// the rows new ids. A backend that can update a row in place --
+    /// PostgreSQL -- overrides it.
+    virtual bool update(const std::vector<FaceEntry>& entries,
+                        std::string& error);
 
     /// Stores one extra sample for an already-enrolled person.
     ///

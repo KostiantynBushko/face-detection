@@ -348,6 +348,9 @@ struct InsertParams {
     std::string embedding;
     std::string user_name;
     std::string metadata;
+    // The id of the row an UPDATE changes. It lives here, because the
+    // pointers of the values are used after the builder has returned.
+    std::string row_id;
     std::vector<const char*> values;
     std::vector<int> formats;
     std::vector<int> lengths;
@@ -433,6 +436,86 @@ bool buildInsert(const std::string& table, bool has_user_name, bool has_photo,
 
     sql = "INSERT INTO " + quoteIdentifier(table) + " (" + columns +
           ") VALUES (" + placeholders + ")";
+    return true;
+}
+
+/// Builds the UPDATE that changes one sample in place.
+///
+/// The columns that the table does not have are left out, the same way
+/// buildInsert() leaves them out. The id of the row is the last parameter,
+/// so that the statement is "UPDATE ... WHERE id = $n".
+bool buildUpdate(const std::string& table, bool has_user_name, bool has_photo,
+                 bool has_metadata, const FaceEntry& entry,
+                 InsertParams& params, std::string& sql, std::string& error) {
+    params.embedding = toArrayLiteral(entry.embedding);
+    if (params.embedding.empty()) {
+        error = "the embedding holds a value PostgreSQL cannot store";
+        return false;
+    }
+
+    if (entry.info.metadata.empty()) {
+        params.metadata = "{}";
+    } else if (!isValidJson(entry.info.metadata)) {
+        error = "the metadata of person " + std::to_string(entry.person_id) +
+                " is not a valid JSON document";
+        return false;
+    } else {
+        params.metadata = entry.info.metadata;
+    }
+
+    params.person_id = std::to_string(entry.person_id);
+    params.user_name = entry.info.user_name;
+
+    std::string assignments;
+    params.values.clear();
+    params.formats.clear();
+    params.lengths.clear();
+
+    const auto add = [&params](const char* value, int format, int length) {
+        params.values.push_back(value);
+        params.formats.push_back(format);
+        params.lengths.push_back(length);
+    };
+
+    const auto next = [&params]() {
+        return "$" + std::to_string(params.values.size() + 1);
+    };
+
+    assignments = "person_id = " + next() + "::integer";
+    add(params.person_id.c_str(), 0, static_cast<int>(params.person_id.size()));
+
+    assignments += ", embedding = " + next() + "::real[]";
+    add(params.embedding.c_str(), 0, static_cast<int>(params.embedding.size()));
+
+    if (has_user_name) {
+        assignments += ", user_name = " + next() + "::text";
+        add(params.user_name.c_str(), 0,
+            static_cast<int>(params.user_name.size()));
+    }
+
+    if (has_photo) {
+        assignments += ", photo = " + next() + "::bytea";
+        if (entry.info.photo.empty()) {
+            add(nullptr, 1, 0);
+        } else {
+            add(reinterpret_cast<const char*>(entry.info.photo.data()), 1,
+                static_cast<int>(entry.info.photo.size()));
+        }
+    }
+
+    if (has_metadata) {
+        assignments += ", metadata = " + next() + "::jsonb";
+        add(params.metadata.c_str(), 0, static_cast<int>(params.metadata.size()));
+    }
+
+    // The id of the row comes last, so that it is the one parameter that
+    // is not part of the assignments.
+    const std::string idPlaceholder = next();
+    params.row_id = std::to_string(entry.row_id);
+    add(params.row_id.c_str(), 0, static_cast<int>(params.row_id.size()));
+
+    sql = "UPDATE " + quoteIdentifier(table) + " SET " + assignments +
+          " WHERE id = " + idPlaceholder + "::bigint";
     return true;
 }
 
@@ -768,7 +851,9 @@ bool PostgresFaceStore::load(std::vector<FaceEntry>& out, std::string& error) {
     // index of a column is its position in that list -- and counting the
     // commas of the statement would not do, as one of the expressions
     // holds a comma of its own.
-    std::vector<std::string> columns{"person_id", "embedding"};
+    // The id of the row comes first: it is what an update needs to find
+    // the row again.
+    std::vector<std::string> columns{"id", "person_id", "embedding"};
     int user_name_column = -1;
     int photo_column = -1;
     int metadata_column = -1;
@@ -811,12 +896,14 @@ bool PostgresFaceStore::load(std::vector<FaceEntry>& out, std::string& error) {
 
     const int rows = PQntuples(result);
     for (int row = 0; row < rows; ++row) {
-        if (PQgetisnull(result, row, 0) || PQgetisnull(result, row, 1)) {
+        if (PQgetisnull(result, row, 0) || PQgetisnull(result, row, 1) ||
+            PQgetisnull(result, row, 2)) {
             continue;
         }
 
-        const char* person_text = PQgetvalue(result, row, 0);
-        const char* embedding_text = PQgetvalue(result, row, 1);
+        const char* id_text = PQgetvalue(result, row, 0);
+        const char* person_text = PQgetvalue(result, row, 1);
+        const char* embedding_text = PQgetvalue(result, row, 2);
 
         std::vector<float> values;
         if (!parseArrayLiteral(embedding_text, values) ||
@@ -829,6 +916,7 @@ bool PostgresFaceStore::load(std::vector<FaceEntry>& out, std::string& error) {
         }
 
         FaceEntry entry;
+        entry.row_id = std::atol(id_text);
         entry.person_id = std::atoi(person_text);
         std::copy(values.begin(), values.end(),
                   entry.embedding.values.begin());
@@ -968,6 +1056,73 @@ bool PostgresFaceStore::save(const std::vector<FaceEntry>& entries,
                         static_cast<int>(params.values.size()), error,
                         params.formats.data(), params.lengths.data())) {
             execCommand(impl_->conn, "ROLLBACK", error);
+            return false;
+        }
+    }
+
+    return execCommand(impl_->conn, "COMMIT", error);
+}
+
+bool PostgresFaceStore::update(const std::vector<FaceEntry>& entries,
+                               std::string& error) {
+    if (!isOpen()) {
+        error = "the PostgreSQL store is not open";
+        return false;
+    }
+    if (entries.empty()) {
+        return true;
+    }
+
+    // The samples are written in one transaction: either every change is
+    // stored or none of it is.
+    if (!execCommand(impl_->conn, "BEGIN", error)) {
+        return false;
+    }
+
+    const auto rollback = [this]() {
+        std::string ignored;
+        execCommand(impl_->conn, "ROLLBACK", ignored);
+    };
+
+    for (const FaceEntry& entry : entries) {
+        if (!entry.embedding.valid) {
+            error = "the database holds an invalid embedding";
+            rollback();
+            return false;
+        }
+
+        // A sample that was read from the store carries the id of its row
+        // and is changed in place: the row keeps its identity and the
+        // time the face was enrolled. A sample without an id is new.
+        if (entry.row_id > 0) {
+            InsertParams params;
+            std::string sql;
+            if (!buildUpdate(impl_->table, impl_->has_user_name,
+                             impl_->has_photo, impl_->has_metadata, entry,
+                             params, sql, error)) {
+                rollback();
+                return false;
+            }
+            if (!execParams(impl_->conn, sql, params.values.data(),
+                            static_cast<int>(params.values.size()), error,
+                            params.formats.data(), params.lengths.data())) {
+                rollback();
+                return false;
+            }
+            continue;
+        }
+
+        InsertParams params;
+        std::string sql;
+        if (!buildInsert(impl_->table, impl_->has_user_name, impl_->has_photo,
+                         impl_->has_metadata, entry, params, sql, error)) {
+            rollback();
+            return false;
+        }
+        if (!execParams(impl_->conn, sql, params.values.data(),
+                        static_cast<int>(params.values.size()), error,
+                        params.formats.data(), params.lengths.data())) {
+            rollback();
             return false;
         }
     }
@@ -1125,6 +1280,12 @@ bool PostgresFaceStore::load(std::vector<FaceEntry>& out, std::string& error) {
 }
 
 bool PostgresFaceStore::save(const std::vector<FaceEntry>&, std::string& error) {
+    error = "this build has no PostgreSQL support";
+    return false;
+}
+
+bool PostgresFaceStore::update(const std::vector<FaceEntry>&,
+                               std::string& error) {
     error = "this build has no PostgreSQL support";
     return false;
 }
