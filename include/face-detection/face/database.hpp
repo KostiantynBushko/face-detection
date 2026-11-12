@@ -11,6 +11,29 @@
 
 namespace fd {
 
+/// How a person is scored against a probe.
+struct PersonMatchOptions {
+    /// The largest score that is still a match. A value <= 0 uses
+    /// FaceDatabase::kDefaultMaxDistance.
+    float max_distance = 0.0f;
+
+    /// How many samples of a person are averaged.
+    ///
+    /// One makes the score the distance to the closest sample -- the
+    /// behaviour of match(). More than one averages the closest samples,
+    /// which is steadier. The default of three is a good compromise: it
+    /// smooths the noise of one sample without hiding a person behind the
+    /// others.
+    int samples = 3;
+
+    /// How much better the best person has to be than the second one.
+    ///
+    /// A value <= 0 accepts any margin. A margin is what keeps a person
+    /// with one good sample from stealing a probe that belongs to
+    /// somebody who is enrolled with several samples.
+    float min_margin = 0.0f;
+};
+
 /// A registry of known faces, keyed by an application-defined person id.
 ///
 /// The database holds the embeddings the matching runs on, together with
@@ -82,6 +105,78 @@ public:
     /// match. A value <= 0 uses kDefaultMaxDistance.
     [[nodiscard]] Match match(const Embedding& embedding,
                               float max_distance = 0.0f) const;
+
+    /// The outcome of a lookup against the *people* of the database.
+    ///
+    /// A person is scored by the agreement of its samples, not by the
+    /// closest one of them: the score is the mean distance to the
+    /// @c samples samples of the person that are the closest to the probe.
+    /// A person with several samples is therefore steadier than a person
+    /// with one, which is what a database that is filled by watching
+    /// people needs.
+    struct PersonMatch {
+        /// Id of the best matching person, or -1 when the database is
+        /// empty.
+        int person_id = -1;
+
+        /// The score of that person. Lower is better.
+        float distance = 1.0f;
+
+        /// Id of the second best person, or -1.
+        int runner_up_id = -1;
+
+        /// The score of the second best person.
+        float runner_up = 1.0f;
+
+        /// How much better the best person is than the second one.
+        ///
+        /// A small margin means that the probe is not clearly one person
+        /// rather than the other, and the caller may want to refuse the
+        /// match.
+        float margin = 0.0f;
+
+        /// True when the match was accepted: the score is within the
+        /// threshold and the margin is large enough.
+        bool matched = false;
+
+        /// The name of the matched person, when one of its samples carries
+        /// one.
+        std::string user_name;
+    };
+
+    /// Finds the person that @p embedding belongs to.
+    ///
+    /// Every person of the database is scored, and the best one is
+    /// returned together with the second best one, so that the caller can
+    /// tell a clear match from a doubtful one.
+    [[nodiscard]] PersonMatch matchPerson(
+        const Embedding& embedding,
+        const PersonMatchOptions& options = {}) const;
+
+    /// How similar two people are.
+    ///
+    /// The distance is the mean of the @p samples smallest distances
+    /// between the samples of the two people. It is 1.0 when one of them
+    /// has no samples at all.
+    ///
+    /// This is what tells two people that were enrolled twice apart from
+    /// two people that merely look alike.
+    [[nodiscard]] float personDistance(int a, int b, int samples = 3) const;
+
+    /// The people of the database.
+    struct PersonInfo {
+        /// The id of the person.
+        int person_id = -1;
+
+        /// How many samples the person has.
+        std::size_t samples = 0;
+
+        /// The name of the person, when one of its samples carries one.
+        std::string user_name;
+    };
+
+    /// The people of the database, with the number of their samples.
+    [[nodiscard]] std::vector<PersonInfo> people() const;
 
     /// Removes every sample belonging to @p person_id.
     /// Returns the number of removed entries.

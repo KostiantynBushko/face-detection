@@ -368,6 +368,104 @@ int main() {
               "the name of a reloaded sample comes back as well");
     }
 
+    // ---- the person-level matcher ----------------------------------------
+    // A person is scored by the agreement of its samples, not by the
+    // closest one of them. That is what recognises a person who was
+    // enrolled in another session, where no single sample is close
+    // enough.
+    {
+        FaceDatabase db;
+        check(db.matchPerson(makeEmbeddingOnAxis(0)).person_id == -1,
+              "matching an empty database finds nobody");
+
+        // Two people: one with a single sample, one with three samples
+        // that are near each other.
+        const auto near = [](std::size_t axis, float angle) {
+            fd::Embedding e;
+            e.values[axis] = std::cos(angle);
+            e.values[axis == 0 ? 1 : 0] = std::sin(angle);
+            e.valid = true;
+            return e;
+        };
+
+        check(db.enroll(1, makeEmbeddingOnAxis(0)), "a person is enrolled");
+        check(db.enroll(2, near(1, 0.0f)), "another person is enrolled");
+        check(db.enroll(2, near(1, 0.2f)), "a second sample of it");
+        check(db.enroll(2, near(1, 0.4f)), "a third sample of it");
+
+        // The probe looks like the person with the three samples.
+        fd::PersonMatchOptions options;
+        options.samples = 3;
+        options.max_distance = 1.0f;
+
+        const auto hit = db.matchPerson(near(1, 0.25f), options);
+        check(hit.person_id == 2, "the closest person is reported");
+        check(hit.matched, "the person is matched");
+        check(hit.runner_up_id == 1, "the runner-up is reported");
+        check(hit.margin > 0.0f, "the margin is positive");
+
+        // The score of a person is the mean distance to the few of its
+        // samples that are the closest: 0.031, 0.001 and 0.011.
+        check(hit.distance > 0.01f && hit.distance < 0.02f,
+              "the score of a person with three samples averages them");
+
+        // One sample makes the score the distance to the closest one.
+        options.samples = 1;
+        const auto single = db.matchPerson(near(1, 0.25f), options);
+        check(single.person_id == 2, "the same person is still the closest");
+        check(single.distance < hit.distance,
+              "the score of the closest sample alone is smaller");
+
+        // The margin keeps a doubtful match out.
+        options.samples = 3;
+        options.min_margin = 0.9f;
+        const auto doubtful = db.matchPerson(near(1, 0.25f), options);
+        check(!doubtful.matched, "a match without a margin is refused");
+        check(doubtful.person_id == 2,
+              "the closest person is still reported without a margin");
+    }
+
+    // ---- how similar two people are ---------------------------------------
+    {
+        FaceDatabase db;
+        db.enroll(1, makeEmbeddingOnAxis(0));
+        db.enroll(2, makeEmbeddingOnAxis(1));
+
+        // Two people that have nothing in common.
+        check(db.personDistance(1, 2) > 0.9f,
+              "two different people are far apart");
+
+        // The same person, enrolled twice: the two ids are close, which
+        // is what the duplicates report looks for.
+        db.enroll(3, makeEmbedding(0.999f));
+        check(db.personDistance(1, 3) < 0.01f,
+              "a person who was enrolled twice is close to itself");
+
+        // A person that is not in the database.
+        check(db.personDistance(1, 99) == 1.0f,
+              "a person that is not in the database is at distance 1");
+    }
+
+    // ---- the people of the database ---------------------------------------
+    {
+        FaceDatabase db;
+        using fd::EnrolmentInfo;
+        EnrolmentInfo named;
+        named.user_name = "Ada Lovelace";
+        db.enroll(1, makeEmbeddingOnAxis(0), named);
+        db.enroll(1, makeEmbeddingOnAxis(0), named);
+        db.enroll(2, makeEmbeddingOnAxis(1));
+
+        const std::vector<fd::FaceDatabase::PersonInfo> people = db.people();
+        check(people.size() == 2, "the database holds two people");
+        check(people[0].person_id == 1, "the first person is reported");
+        check(people[0].samples == 2, "the number of samples is counted");
+        check(people[0].user_name == "Ada Lovelace",
+              "the name of the person is reported");
+        check(people[1].person_id == 2, "the second person is reported");
+        check(people[1].samples == 1, "the second person has one sample");
+    }
+
     // ---- the name of a person does not depend on the closest sample ----
     // A person can have several samples, and only some of them carry the
     // name. The name belongs to the person, so it has to come back even
